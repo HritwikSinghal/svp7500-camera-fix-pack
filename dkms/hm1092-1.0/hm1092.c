@@ -664,18 +664,24 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	int ret;
 
+	dev_info(&client->dev, "hm1092_set_stream: enable=%d ENTER\n", enable);
+
 	if (enable) {
 		ret = pm_runtime_resume_and_get(&client->dev);
+		dev_info(&client->dev, "  pm_runtime_resume_and_get returned %d\n", ret);
 		if (ret && ret != -EACCES)
 			return ret;
 
 		/* Write init sequence */
+		dev_info(&client->dev, "  writing %zu-entry init sequence...\n",
+			 ARRAY_SIZE(hm1092_init_regs));
 		ret = hm1092_write_reg_list(client, hm1092_init_regs,
 					     ARRAY_SIZE(hm1092_init_regs));
 		if (ret) {
 			dev_err(&client->dev, "init sequence failed: %d\n", ret);
 			goto err_rpm;
 		}
+		dev_info(&client->dev, "  init sequence written OK\n");
 
 		/* Apply controls */
 		ret = __v4l2_ctrl_handler_setup(&hm->ctrl_handler);
@@ -683,42 +689,87 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 			dev_err(&client->dev, "ctrl setup failed: %d\n", ret);
 			goto err_rpm;
 		}
+		dev_info(&client->dev, "  v4l2 controls applied OK\n");
 
 		/* Start streaming */
+		dev_info(&client->dev, "  writing MODE_SELECT=0x01 (streaming)...\n");
 		ret = hm1092_write_reg(client, HM1092_REG_MODE_SELECT,
 				       HM1092_MODE_STREAMING);
 		if (ret) {
 			dev_err(&client->dev, "stream start failed: %d\n", ret);
 			goto err_rpm;
 		}
+		dev_info(&client->dev, "  MODE_SELECT=0x01 ack'd by sensor\n");
 
 		/* Lazy-enable IR LED only while streaming */
 		if (hm->ir_led) {
 			gpiod_set_value_cansleep(hm->ir_led, 1);
-			dev_dbg(&client->dev, "IR LED on\n");
+			dev_info(&client->dev, "  IR LED gpio set to 1\n");
 		}
 
 		hm->streaming = true;
+		dev_info(&client->dev, "hm1092_set_stream(1) EXIT — sensor is now streaming\n");
 	} else {
 		hm->streaming = false;
 
 		/* Turn off IR LED before sensor goes to standby */
 		if (hm->ir_led) {
 			gpiod_set_value_cansleep(hm->ir_led, 0);
-			dev_dbg(&client->dev, "IR LED off\n");
+			dev_info(&client->dev, "  IR LED gpio set to 0\n");
 		}
 
 		ret = hm1092_write_reg(client, HM1092_REG_MODE_SELECT,
 				       HM1092_MODE_STANDBY);
+		dev_info(&client->dev, "  MODE_SELECT=0x00 (standby) write returned %d\n", ret);
 		pm_runtime_put_noidle(&client->dev);
+		dev_info(&client->dev, "hm1092_set_stream(0) EXIT\n");
 	}
 
 	return 0;
 
 err_rpm:
 	pm_runtime_put(&client->dev);
+	dev_info(&client->dev, "hm1092_set_stream EXIT with error %d\n", ret);
 	return ret;
 }
+
+/*
+ * sysfs `stream` attribute — manual hook to invoke hm1092_set_stream()
+ * directly, bypassing the V4L2 pipeline's s_stream propagation. This is a
+ * diagnostic tool: when v4l2-ctl STREAMON on /dev/video16 fails to walk up
+ * to this sensor (because the ipu7-isys driver hands off to firmware and
+ * never calls v4l2_subdev_call(sd, video, s_stream, 1)), we can drive the
+ * sensor manually:
+ *     echo 1 > /sys/bus/i2c/devices/i2c-HIMX1092:00/stream
+ *     <run capture>
+ *     echo 0 > /sys/bus/i2c/devices/i2c-HIMX1092:00/stream
+ */
+static ssize_t stream_show(struct device *dev,
+			   struct device_attribute *attr, char *buf)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct hm1092 *hm = to_hm1092(sd);
+
+	return sprintf(buf, "%d\n", hm->streaming ? 1 : 0);
+}
+
+static ssize_t stream_store(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	int enable, ret;
+
+	if (kstrtoint(buf, 0, &enable))
+		return -EINVAL;
+
+	ret = hm1092_set_stream(sd, !!enable);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(stream);
 
 static int hm1092_init_state(struct v4l2_subdev *sd,
 			      struct v4l2_subdev_state *state)
@@ -919,6 +970,13 @@ static int hm1092_probe(struct i2c_client *client)
 	pm_runtime_enable(dev);
 	pm_runtime_idle(dev);
 
+	/* Diagnostic: manual sensor-stream trigger. Non-fatal if it fails. */
+	ret = device_create_file(dev, &dev_attr_stream);
+	if (ret)
+		dev_warn(dev, "Failed to create sysfs 'stream' attr: %d\n", ret);
+	else
+		dev_info(dev, "sysfs 'stream' attr ready at /sys/bus/i2c/devices/i2c-HIMX1092:00/stream\n");
+
 	dev_info(dev, "HM1092 IR sensor driver probed successfully\n");
 	return 0;
 
@@ -933,6 +991,8 @@ static void hm1092_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct hm1092 *hm = to_hm1092(sd);
+
+	device_remove_file(&client->dev, &dev_attr_stream);
 
 	/* Safety: ensure IR LED is off on driver unload */
 	if (hm->ir_led)

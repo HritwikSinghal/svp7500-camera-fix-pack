@@ -17,8 +17,80 @@
 
 #include "cvs_gpio.h"
 #include "intel_cvs_update.h"
+#include "rgb_hello_init.h"
 
 struct intel_cvs *cvs;
+
+/*
+ * cvs_replay_rgb_hello_init - replay the verbatim Windows-Hello RGB sensor
+ * init stream via the kernel I2C path.
+ *
+ * windows_hello_unlock USBPcap shows Windows writes 344 entries to the OV08x40
+ * RGB sensor (I2C addr 0x36) during Hello setup, including a ~30-burst-write
+ * calibration LUT to registers 0x005b-0x005e that camera-only workflows never
+ * touch. We replay it verbatim through i2c_transfer() on the CVS bridge's own
+ * adapter — this is the same path our 256-byte HOST_SET_MIPI_CONFIG goes over,
+ * which is known not to wedge the bridge. (Direct userspace i2ctransfer to
+ * 0x36 *does* wedge it, presumably because of pm_runtime / power coordination
+ * the kernel handles for us.)
+ *
+ * PRECONDITION: RGB sensor must already be powered (e.g. libcamera holding
+ * pm_runtime via ov08x40, or some other driver path). If not powered, the
+ * very first transfer will time out and propagate.
+ *
+ * Returns 0 on full success, negative errno on any failure. Logs a count of
+ * successful vs failed writes.
+ */
+int cvs_replay_rgb_hello_init(void)
+{
+	struct i2c_client *i2c;
+	int i, ret;
+	int ok = 0, fail = 0;
+
+	if (!cvs || !cvs->dev) {
+		pr_err("intel_cvs: cvs_replay_rgb_hello_init: cvs not initialized\n");
+		return -ENODEV;
+	}
+
+	i2c = container_of(cvs->dev, struct i2c_client, dev);
+	if (!i2c || !i2c->adapter) {
+		dev_err(cvs->dev, "%s: no i2c adapter\n", __func__);
+		return -ENODEV;
+	}
+
+	dev_info(cvs->dev, "%s: replaying %d verbatim Windows Hello RGB writes...\n",
+		 __func__, RGB_HELLO_INIT_COUNT);
+
+	for (i = 0; i < RGB_HELLO_INIT_COUNT; i++) {
+		const struct cvs_replay_entry *e = &rgb_hello_init[i];
+		struct i2c_msg msg = {
+			.addr	= e->addr,
+			.flags	= 0,
+			.len	= e->len,
+			.buf	= (u8 *)e->data,
+		};
+
+		ret = i2c_transfer(i2c->adapter, &msg, 1);
+		if (ret == 1) {
+			ok++;
+		} else {
+			fail++;
+			if (fail <= 5)
+				dev_warn(cvs->dev,
+					 "%s: entry %d (addr 0x%02x len %d) failed: %d\n",
+					 __func__, i, e->addr, e->len, ret);
+			if (fail == 6)
+				dev_warn(cvs->dev,
+					 "%s: ...further failures suppressed\n",
+					 __func__);
+		}
+	}
+
+	dev_info(cvs->dev, "%s: done — %d ok, %d failed (of %d)\n",
+		 __func__, ok, fail, RGB_HELLO_INIT_COUNT);
+
+	return fail ? -EIO : 0;
+}
 
 static irqreturn_t cvs_irq_handler(int irq, void *devid)
 {
@@ -638,6 +710,20 @@ static ssize_t cmd_store(struct device *dev, struct device_attribute *attr,
 			 "%s: manual HOST_SET_MIPI_CONFIG returned %d (IR verbatim)",
 			 __func__, r);
 	}
+	else if (sysfs_streq(buf, "replay-rgb-init")) {
+		/*
+		 * Replay the verbatim 344-write Windows-Hello RGB init stream
+		 * via kernel I2C path. Includes the 0x005b-0x005e calibration
+		 * LUT that camera-only workflows never touch. Must be called
+		 * AFTER ov08x40 has acquired pm_runtime (e.g. libcamera RGB
+		 * streaming) — otherwise the sensor is unpowered and the first
+		 * transfer will time out and wedge the bridge.
+		 */
+		int r = cvs_replay_rgb_hello_init();
+		dev_info(cvs->dev,
+			 "%s: cvs_replay_rgb_hello_init returned %d",
+			 __func__, r);
+	}
 	else
 		dev_err(cvs->dev, "%s:invalid %s command\n", __func__, buf);
 
@@ -648,7 +734,7 @@ static ssize_t cmd_show(struct device *dev, struct device_attribute *attr,
 						char *buf)
 {
 	return sysfs_emit(buf, "command: %s\n",
-			  "[coredump, state, version, id, reset, acquire, mipi, mipi-ir]");
+			  "[coredump, state, version, id, reset, acquire, mipi, mipi-ir, replay-rgb-init]");
 }
 static DEVICE_ATTR_RW(cmd);
 #endif //DEBUG_CVS
