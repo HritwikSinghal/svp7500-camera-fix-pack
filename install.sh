@@ -1,21 +1,32 @@
 #!/bin/bash
 #
-# Synaptics SVP7500 + Intel IPU7 camera fix pack — installer
+# Synaptics SVP7500 + Intel IPU7 camera fix pack — installer (v0.3)
 #
 # Restores RGB camera functionality on Linux for laptops with:
 #   - Intel IPU7 (Panther Lake or Lunar Lake)
 #   - Synaptics SVP7500 CVS bridge (USB 06CB:0701)
 #   - OmniVision OV08x40 RGB sensor + Himax HM1092 IR sensor
 #
-# Tested platforms: Dell XPS 16 PB16250 (Panther Lake).
-# Should also help: Dell Latitude 9440/7440/7450, Lenovo ThinkPad X9,
-# ASUS Vivobook X1407Q, any other laptop with the SVP7500 bridge.
+# Tested platforms (confirmed working):
+#   - Dell XPS 16 PB16250 / Panther Lake (CachyOS 7.0.5-2-cachyos-susfix)
+#   - Dell XPS 16 DA16260 / Panther Lake (Fedora 44 Silverblue 7.0.4-200, via
+#     @tverhaeghe intel/vision-drivers#37 comment 4433909742, RGB-only)
+#
+# Should also help (untested, please report):
+#   - Dell Latitude 9440/7440/7450, Lenovo ThinkPad X9,
+#     ASUS Vivobook X1407Q, any other laptop with the SVP7500 bridge.
 #
 # What's included:
 #   1. intel-cvs DKMS — bridge controller driver
 #      * IRQF_ONESHOT fix (real kernel API bug — bridge stability)
-#      * Verbatim RGB + IR 0x830 MIPI configs from Windows traces
-#      * sysfs cmd interface for manual experiments
+#      * Verbatim RGB + IR 0x830 MIPI configs from Windows USBPcap traces
+#      * sysfs cmd interface: [state, version, id, reset, acquire,
+#        mipi, mipi-ir, replay-rgb-init]
+#      * NEW v0.3: cvs_replay_rgb_hello_init() — kernel-side replay of 344
+#        Windows-Hello RGB sensor writes (calibration LUT to 0x005b-0x005e)
+#        via i2c_transfer(). Triggered via `echo replay-rgb-init > .../cmd`.
+#      * NEW v0.3: cvs_send_mipi_ir_config() exported for hm1092 to call
+#        kernel-internally (matching Windows-Hello sensor-streams-first order).
 #   2. int3472-patched DKMS — ACPI power config helper
 #      * IR LED GPIO type 0x02 support
 #      * SSDB controllogicid fallback for USBIO platforms
@@ -23,15 +34,30 @@
 #      * HIMX1092 added to supported_sensors list
 #   4. hm1092 DKMS — IR sensor driver
 #      * Lazy IR LED (only on during streaming)
-#      * 198-register Windows-faithful init sequence
+#      * 240-register Windows-faithful init sequence
+#      * NEW v0.3: hm1092_set_stream(1) calls cvs_send_mipi_ir_config()
+#        AFTER writing MODE_SELECT=0x01 (Windows-Hello ordering)
+#      * NEW v0.3: 3 diagnostic module params for runtime IR experimentation:
+#        - mipi_ir_delay_ms       (ms between MODE_SELECT and bridge 0x830)
+#        - dump_regs_on_stream    (log 0x4b20/0x0101 chip-vs-init at stream)
+#        - ae_kick_period_ms      (periodic 0x0104=0x01 every N ms)
+#        Tune via /sys/module/hm1092/parameters/* — no rebuild needed.
+#      * NEW v0.3: sysfs 'stream' attr at /sys/bus/i2c/.../i2c-HIMX1092:00/
 #   5. udev rule — disable USB autosuspend for SVP7500
 #      (bridge firmware can wedge on power state transitions)
 #
 # Status:
-#   - RGB camera (port 0, ov08x40): expected to WORK after install
-#   - IR camera (port 2, hm1092): probes cleanly, streaming still
-#     under investigation (the bridge accepts our IR config but
-#     port-2 MIPI forwarding requires more work)
+#   - RGB camera (port 0, ov08x40): WORKS after install (2 independent confirms)
+#   - IR camera (port 2, hm1092): still under investigation
+#     * Sensor: enumerates, probes, reaches MODE_SELECT=0x01 streaming
+#     * Bridge: accepts our verbatim IR 0x830 (returns success)
+#     * Gap: bridge does not forward port-2 MIPI (verified via direct
+#       IPU7 CSI-2 MMIO read — zero packets received)
+#     * Hypotheses tested + eliminated 2026-05-12:
+#       - OTP register mismatch (read live, values match init)
+#       - Windows-trace 182ms sensor-to-bridge timing gap
+#       - AE-loop periodic 0x0104=0x01 (Windows fires every ~132ms)
+#     * Under investigation: iaisptrustlet64.dll RE for post-0x830 trigger
 #
 # Requirements:
 #   - DKMS (sudo dnf install dkms / sudo pacman -S dkms / etc.)
@@ -40,6 +66,7 @@
 #
 # Source: https://github.com/intel/vision-drivers/issues/37
 # Findings: https://gist.github.com/jibsta210/8316b6a0bc58910891512945c4e91a08
+# Repo:    https://github.com/jibsta210/svp7500-camera-fix-pack
 
 set -euo pipefail
 
@@ -175,7 +202,7 @@ log "Installed DKMS modules:"
 dkms status | grep -E '(intel-cvs|hm1092|int3472|ipu-bridge)' || warn "No fix-pack DKMS modules showing as installed"
 
 echo ""
-ok "==== Install complete ===="
+ok "==== Install complete (v0.3) ===="
 echo ""
 echo "  Next steps:"
 echo "    1. REBOOT to load the new modules cleanly"
@@ -188,11 +215,26 @@ echo "    3. Test the RGB camera with libcamera:"
 echo "         cam --list             # should show your front camera"
 echo "         cam --camera=1 --capture=5 --file=/tmp/test.raw"
 echo ""
+echo "  RGB camera works. IR is still under investigation. Help us narrow it:"
+echo ""
+echo "    A. After reboot, please post a comment on intel/vision-drivers#37"
+echo "       with: (a) your laptop model, (b) lsusb -d 06cb:0701 output,"
+echo "       (c) whether 'cam --camera=1 --capture=10' captures 10 frames."
+echo ""
+echo "    B. New in v0.3: diagnostic sysfs surfaces for IR experimentation:"
+echo "       - /sys/bus/i2c/devices/i2c-INTC10E1:00/cmd"
+echo "         accepts: state, version, id, reset, acquire, mipi,"
+echo "                  mipi-ir, replay-rgb-init"
+echo "       - /sys/module/hm1092/parameters/{mipi_ir_delay_ms,"
+echo "         dump_regs_on_stream, ae_kick_period_ms}"
+echo "         tunable at runtime (no rebuild needed)"
+echo ""
 echo "  Known issues:"
-echo "    - IR camera (HM1092, Windows Hello) DOES NOT yet stream on Linux."
-echo "      The sensor enumerates and the bridge accepts our IR config,"
-echo "      but port-2 MIPI forwarding is still under investigation."
-echo "      RGB camera should work normally."
+echo "    - IR camera (HM1092, Windows Hello) DOES NOT yet stream."
+echo "      Three hypotheses systematically ruled out 2026-05-12:"
+echo "      OTP mismatch, sensor->bridge timing, AE-loop kicks."
+echo "      Current investigation: iaisptrustlet64.dll RE."
 echo ""
 echo "  Found a bug? Report at https://github.com/intel/vision-drivers/issues/37"
-echo "  Findings: https://gist.github.com/jibsta210/8316b6a0bc58910891512945c4e91a08"
+echo "  Repo + releases:  https://github.com/jibsta210/svp7500-camera-fix-pack"
+echo "  Findings writeup: https://gist.github.com/jibsta210/8316b6a0bc58910891512945c4e91a08"
