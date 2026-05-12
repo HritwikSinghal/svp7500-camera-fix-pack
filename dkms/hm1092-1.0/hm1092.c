@@ -19,11 +19,44 @@
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
+#include <linux/workqueue.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-subdev.h>
+
+/*
+ * Exported by intel_cvs. Fires HOST_SET_MIPI_CONFIG (0x0830) with the verbatim
+ * Windows-trace IR payload, configuring the SVP7500 bridge for port-2 (IR)
+ * forwarding. We call this from hm1092_set_stream(1) AFTER MODE_SELECT=0x01
+ * so the bridge sees an actively-clocking port 2 input when it processes the
+ * config (Windows-Hello ordering, ~182ms gap in the trace).
+ *
+ * Weak ref so hm1092 still loads if intel_cvs is unavailable; we just won't be
+ * able to enable port-2 forwarding from the sensor side.
+ */
+extern int __weak cvs_send_mipi_ir_config(void);
+
+/*
+ * Diagnostic module parameters — runtime-tunable for experiments without
+ * needing a DKMS rebuild. Adjust via:
+ *   echo 200 | sudo tee /sys/module/hm1092/parameters/mipi_ir_delay_ms
+ */
+static unsigned int mipi_ir_delay_ms;
+module_param(mipi_ir_delay_ms, uint, 0644);
+MODULE_PARM_DESC(mipi_ir_delay_ms,
+		 "ms to sleep between sensor MODE_SELECT=0x01 and bridge mipi-ir config (Windows trace has ~182ms here)");
+
+static bool dump_regs_on_stream = false;
+module_param(dump_regs_on_stream, bool, 0644);
+MODULE_PARM_DESC(dump_regs_on_stream,
+		 "If true, log values of 0x4b20 and 0x0101 in hm1092_set_stream(1) - lets us check whether the values we blind-write to chip-specific calibration regs match what the chip actually wants");
+
+static unsigned int ae_kick_period_ms;
+module_param(ae_kick_period_ms, uint, 0644);
+MODULE_PARM_DESC(ae_kick_period_ms,
+		 "If non-zero, hm1092 kicks 0x0104=0x01 to the sensor every N ms while streaming (Windows trace does this every ~132ms - hypothesis is bridge needs periodic refresh to keep MIPI tunnel hot)");
 
 /* Chip identification */
 #define HM1092_CHIP_ID			0x1091	/* Silicon reports 0x1091, not 0x1092 */
@@ -378,6 +411,14 @@ struct hm1092 {
 	struct gpio_desc *ir_led;
 
 	bool streaming;
+
+	/*
+	 * TEST 3: periodic AE-kick worker. Windows trace writes 0x0104=0x01
+	 * to the IR sensor every ~132ms once streaming starts (group-hold
+	 * trigger inside the auto-exposure loop). Hypothesis: bridge keeps
+	 * port-2 MIPI tunnel hot only while this register sees activity.
+	 */
+	struct delayed_work ae_kick_work;
 };
 
 static inline struct hm1092 *to_hm1092(struct v4l2_subdev *sd)
@@ -658,6 +699,31 @@ static int hm1092_get_format(struct v4l2_subdev *sd,
 	return 0;
 }
 
+/*
+ * TEST 3: periodic AE-kick worker. Writes 0x0104=0x01 to the sensor at the
+ * cadence configured via the ae_kick_period_ms module param, mimicking the
+ * AE group-hold trigger Windows fires every ~132ms while streaming. Self-
+ * reschedules until cancelled in hm1092_set_stream(0).
+ */
+static void hm1092_ae_kick_work_fn(struct work_struct *work)
+{
+	struct hm1092 *hm = container_of(to_delayed_work(work),
+					 struct hm1092, ae_kick_work);
+	struct i2c_client *client = v4l2_get_subdevdata(&hm->sd);
+	int ret;
+
+	if (!hm->streaming || !ae_kick_period_ms)
+		return;
+
+	ret = hm1092_write_reg(client, 0x0104, 0x01);
+	if (ret)
+		dev_warn(&client->dev,
+			 "ae_kick 0x0104=0x01 failed: %d (stopping kicks)\n", ret);
+	else
+		schedule_delayed_work(&hm->ae_kick_work,
+				      msecs_to_jiffies(ae_kick_period_ms));
+}
+
 static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct hm1092 *hm = to_hm1092(sd);
@@ -701,6 +767,53 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 		}
 		dev_info(&client->dev, "  MODE_SELECT=0x01 ack'd by sensor\n");
 
+		/*
+		 * TEST 2 instrumentation: dump key sensor regs that may be
+		 * chip-specific (OTP/calibration). If our blind init writes
+		 * stomp values that should be preserved per-chip, this read
+		 * shows it.
+		 */
+		if (dump_regs_on_stream) {
+			u8 v_4b20 = 0xff, v_0101 = 0xff;
+			hm1092_read_reg(client, 0x4b20, &v_4b20);
+			hm1092_read_reg(client, 0x0101, &v_0101);
+			dev_info(&client->dev,
+				 "  REG_DUMP: 0x4b20=0x%02x (init writes 0x9e), 0x0101=0x%02x (init writes 0x03)\n",
+				 v_4b20, v_0101);
+		}
+
+		/*
+		 * TEST 1: Optional delay between sensor MODE_SELECT=0x01 and
+		 * bridge mipi-ir config. Windows trace has ~182ms between these
+		 * two events. We do them in <3ms by default. If the bridge needs
+		 * the sensor PLL to stabilize before configuring port 2, this
+		 * delay matters.
+		 */
+		if (mipi_ir_delay_ms) {
+			dev_info(&client->dev,
+				 "  sleeping %u ms before bridge mipi-ir config (Windows-Hello ordering)...\n",
+				 mipi_ir_delay_ms);
+			msleep(mipi_ir_delay_ms);
+		}
+
+		/*
+		 * Now that sensor is clocking the CSI-2 lane, ask intel_cvs to
+		 * fire HOST_SET_MIPI_CONFIG (0x0830) for IR/port-2. This is the
+		 * Windows ordering: sensor 0x0100=0x01 FIRST, bridge 0x830
+		 * AFTER, so the bridge sees an active port-2 input when
+		 * it processes the config. Previously we did it backwards and
+		 * port 2 stayed silent.
+		 */
+		if (cvs_send_mipi_ir_config) {
+			int cvs_ret = cvs_send_mipi_ir_config();
+			dev_info(&client->dev,
+				 "  intel_cvs port-2 mipi config returned %d\n",
+				 cvs_ret);
+		} else {
+			dev_warn(&client->dev,
+				 "  intel_cvs symbol unavailable; port-2 forwarding NOT configured\n");
+		}
+
 		/* Lazy-enable IR LED only while streaming */
 		if (hm->ir_led) {
 			gpiod_set_value_cansleep(hm->ir_led, 1);
@@ -708,9 +821,22 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 		}
 
 		hm->streaming = true;
+
+		/* TEST 3: kick off periodic AE-trigger writes if enabled */
+		if (ae_kick_period_ms) {
+			dev_info(&client->dev,
+				 "  scheduling AE-kick (0x0104=0x01) every %u ms\n",
+				 ae_kick_period_ms);
+			schedule_delayed_work(&hm->ae_kick_work,
+					      msecs_to_jiffies(ae_kick_period_ms));
+		}
+
 		dev_info(&client->dev, "hm1092_set_stream(1) EXIT — sensor is now streaming\n");
 	} else {
 		hm->streaming = false;
+
+		/* Cancel any pending AE-kick before sensor goes to standby */
+		cancel_delayed_work_sync(&hm->ae_kick_work);
 
 		/* Turn off IR LED before sensor goes to standby */
 		if (hm->ir_led) {
@@ -846,6 +972,9 @@ static int hm1092_probe(struct i2c_client *client)
 
 	v4l2_i2c_subdev_init(&hm->sd, client, &hm1092_subdev_ops);
 	hm->sd.internal_ops = &hm1092_internal_ops;
+
+	/* TEST 3: init delayed_work for optional AE-kick */
+	INIT_DELAYED_WORK(&hm->ae_kick_work, hm1092_ae_kick_work_fn);
 
 	/*
 	 * Request power supplies from INT3472. Use devm_regulator_get_optional
@@ -993,6 +1122,9 @@ static void hm1092_remove(struct i2c_client *client)
 	struct hm1092 *hm = to_hm1092(sd);
 
 	device_remove_file(&client->dev, &dev_attr_stream);
+
+	/* Ensure any pending AE-kick is cancelled before we tear down */
+	cancel_delayed_work_sync(&hm->ae_kick_work);
 
 	/* Safety: ensure IR LED is off on driver unload */
 	if (hm->ir_led)

@@ -41,6 +41,29 @@ struct intel_cvs *cvs;
  * Returns 0 on full success, negative errno on any failure. Logs a count of
  * successful vs failed writes.
  */
+/*
+ * cvs_send_mipi_ir_config - send the verbatim Windows-trace IR HOST_SET_MIPI_CONFIG
+ * (0x0830) payload to the SVP7500 bridge so port-2 forwarding gets configured.
+ *
+ * Per Windows USBPcap analysis of the Hello-unlock trace, Windows sends 0x830
+ * AFTER the IR sensor is already in streaming mode (MODE_SELECT=0x01) by ~182ms.
+ * Our prior `mipi-ir` sysfs fired 0x830 BEFORE the sensor was streaming, leaving
+ * port 2 silent forever. hm1092's s_stream(1) now calls this immediately after
+ * writing MODE_SELECT=0x01, matching the Windows order.
+ *
+ * Returns 0 on success, negative errno on failure. Safe to call multiple times.
+ */
+int cvs_send_mipi_ir_config(void)
+{
+	if (!cvs || !cvs->dev) {
+		pr_err("intel_cvs: cvs_send_mipi_ir_config: not initialized\n");
+		return -ENODEV;
+	}
+	/* len=1 sentinel selects the IR (port 2) verbatim payload in cvs_write_i2c */
+	return cvs_write_i2c(HOST_SET_MIPI_CONFIG, NULL, 1);
+}
+EXPORT_SYMBOL_GPL(cvs_send_mipi_ir_config);
+
 int cvs_replay_rgb_hello_init(void)
 {
 	struct i2c_client *i2c;
