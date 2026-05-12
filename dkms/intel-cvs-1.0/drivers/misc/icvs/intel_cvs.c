@@ -53,14 +53,58 @@ struct intel_cvs *cvs;
  *
  * Returns 0 on success, negative errno on failure. Safe to call multiple times.
  */
+/*
+ * cvs_send_2byte_cmd - send a raw 2-byte opcode to the bridge (big-endian).
+ * Used for 0x820 / 0x822 — Vision.sys-known short commands we never see
+ * Windows use during Hello unlock USBPcap. Per RE of Vision.sys, the bridge
+ * accepts these but their effect is undocumented. Long-shot probe.
+ */
+int cvs_send_2byte_cmd(u16 cmd)
+{
+	struct i2c_client *i2c;
+	u8 buf[2];
+	int cnt;
+
+	if (!cvs || !cvs->dev)
+		return -ENODEV;
+	i2c = container_of(cvs->dev, struct i2c_client, dev);
+	buf[0] = (cmd >> 8) & 0xFF;
+	buf[1] = cmd & 0xFF;
+	cnt = i2c_master_send(i2c, buf, 2);
+	dev_info(cvs->dev, "%s: cmd=0x%04x i2c_master_send returned %d\n",
+		 __func__, cmd, cnt);
+	return cnt == 2 ? 0 : -EIO;
+}
+
 int cvs_send_mipi_ir_config(void)
 {
+	int ret;
+	u8 state = 0xff;
+
 	if (!cvs || !cvs->dev) {
 		pr_err("intel_cvs: cvs_send_mipi_ir_config: not initialized\n");
 		return -ENODEV;
 	}
 	/* len=1 sentinel selects the IR (port 2) verbatim payload in cvs_write_i2c */
-	return cvs_write_i2c(HOST_SET_MIPI_CONFIG, NULL, 1);
+	ret = cvs_write_i2c(HOST_SET_MIPI_CONFIG, NULL, 1);
+
+	/*
+	 * TEST 3: probe bridge state immediately after 0x830 returns. Per
+	 * Vision.sys RE, Windows calls GET_DEVICE_STATE on failure paths
+	 * but not in normal stream-start. We do it here for diagnostic —
+	 * if the bridge reports a non-0x06 state byte after our IR 0x830,
+	 * that's a smoking gun ("PLL fail", "lane error", etc).
+	 */
+	if (cvs_read_i2c(GET_DEVICE_STATE, (char *)&state, sizeof(state)) > 0)
+		dev_info(cvs->dev,
+			 "%s: post-0x830 GET_DEVICE_STATE = 0x%02x\n",
+			 __func__, state);
+	else
+		dev_warn(cvs->dev,
+			 "%s: post-0x830 GET_DEVICE_STATE read failed\n",
+			 __func__);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(cvs_send_mipi_ir_config);
 
@@ -733,6 +777,102 @@ static ssize_t cmd_store(struct device *dev, struct device_attribute *attr,
 			 "%s: manual HOST_SET_MIPI_CONFIG returned %d (IR verbatim)",
 			 __func__, r);
 	}
+	else if (sysfs_streq(buf, "cmd-820")) {
+		int r = cvs_send_2byte_cmd(0x0820);
+		dev_info(cvs->dev, "%s: cmd-820 returned %d", __func__, r);
+	}
+	else if (sysfs_streq(buf, "cmd-822")) {
+		int r = cvs_send_2byte_cmd(0x0822);
+		dev_info(cvs->dev, "%s: cmd-822 returned %d", __func__, r);
+	}
+	else if (sysfs_streq(buf, "set-vision")) {
+		/*
+		 * Send SET_HOST_IDENTIFIER (0x0805) with vision_sensing=1.
+		 * Probe-time call sends vision_sensing=0; if the bridge gates
+		 * IR/Hello port forwarding on this flag (it IS the "Computer
+		 * Vision Sensor" — vision is its purpose), flipping this to 1
+		 * may be required to enable port 2.
+		 */
+		struct i2c_client *i2c = container_of(cvs->dev, struct i2c_client, dev);
+		union cv_host_identifiers hi = { .value = 0 };
+		u8 buf2[2 + 4];
+		int cnt;
+
+		hi.field.vision_sensing = 1;
+		hi.field.rgbcamera_pwrup_host = 1;  /* same as probe — preserve */
+
+		buf2[0] = 0x08;
+		buf2[1] = 0x05;
+		memcpy(&buf2[2], &hi.value, 4);
+		cnt = i2c_master_send(i2c, buf2, sizeof(buf2));
+		dev_info(cvs->dev,
+			 "%s: SET_HOST_IDENTIFIER vision_sensing=1 sent %d/%zu bytes\n",
+			 __func__, cnt, sizeof(buf2));
+	}
+	else if (sysfs_streq(buf, "factory-reset")) {
+		/*
+		 * FACTORY_RESET (0x0831) — untested upstream opcode. May clear
+		 * a stuck internal state preventing port-2 forwarding. Safe to
+		 * try once at idle (state=0x06).
+		 */
+		int r = cvs_send_2byte_cmd(0x0831);
+		dev_info(cvs->dev, "%s: factory-reset returned %d", __func__, r);
+	}
+	else if (strncmp(buf, "cmd-", 4) == 0) {
+		/*
+		 * Generic "send raw 2-byte opcode" path. Accepts
+		 *   echo cmd-NNNN > cmd
+		 * where NNNN is a hex opcode (e.g. cmd-0823 or cmd-823 or
+		 * cmd-83a). Logs pre-state, send result, and post-state to
+		 * dmesg so userspace scan scripts can iterate the opcode
+		 * space and detect which ones affect bridge state.
+		 */
+		u16 op = 0;
+		const char *hex = buf + 4;
+		size_t hlen;
+		char tmp[8];
+		u8 pre_state = 0xff, post_state = 0xff;
+		int rc, len_ok;
+
+		/* Skip optional 0x prefix */
+		if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X'))
+			hex += 2;
+
+		/* Strip trailing newline + whitespace */
+		hlen = strnlen(hex, sizeof(tmp));
+		while (hlen && (hex[hlen-1] == '\n' || hex[hlen-1] == ' '))
+			hlen--;
+		if (hlen == 0 || hlen >= sizeof(tmp)) {
+			dev_err(cvs->dev, "%s: cmd-NNNN: bad hex length %zu\n",
+				__func__, hlen);
+			return count;
+		}
+		memcpy(tmp, hex, hlen);
+		tmp[hlen] = '\0';
+
+		len_ok = kstrtou16(tmp, 16, &op);
+		if (len_ok) {
+			dev_err(cvs->dev, "%s: cmd-NNNN: parse error '%s'\n",
+				__func__, tmp);
+			return count;
+		}
+
+		/* Read state before */
+		if (cvs_read_i2c(GET_DEVICE_STATE, (char *)&pre_state, 1) <= 0)
+			pre_state = 0xff;
+
+		/* Fire opcode */
+		rc = cvs_send_2byte_cmd(op);
+
+		/* Read state after */
+		mdelay(50);
+		if (cvs_read_i2c(GET_DEVICE_STATE, (char *)&post_state, 1) <= 0)
+			post_state = 0xff;
+
+		dev_info(cvs->dev,
+			 "SCAN op=0x%04x pre=0x%02x send_rc=%d post=0x%02x delta=0x%02x\n",
+			 op, pre_state, rc, post_state, pre_state ^ post_state);
+	}
 	else if (sysfs_streq(buf, "replay-rgb-init")) {
 		/*
 		 * Replay the verbatim 344-write Windows-Hello RGB init stream
@@ -757,7 +897,7 @@ static ssize_t cmd_show(struct device *dev, struct device_attribute *attr,
 						char *buf)
 {
 	return sysfs_emit(buf, "command: %s\n",
-			  "[coredump, state, version, id, reset, acquire, mipi, mipi-ir, replay-rgb-init]");
+			  "[coredump, state, version, id, reset, acquire, mipi, mipi-ir, replay-rgb-init, cmd-820, cmd-822, set-vision, factory-reset, cmd-NNNN]");
 }
 static DEVICE_ATTR_RW(cmd);
 #endif //DEBUG_CVS

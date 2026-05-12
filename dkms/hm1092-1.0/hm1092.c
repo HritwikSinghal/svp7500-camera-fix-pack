@@ -797,6 +797,22 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 		}
 
 		/*
+		 * TEST 2: log MCLK rate right before we tell the bridge to
+		 * forward port 2. If the rate has gone to 0, INT3472 / tps68470
+		 * silently cut the clock during our flow and bridge will reach
+		 * a "no MCLK seen" state on port 2. Defensive: re-prepare/
+		 * enable to bump refcount and force MCLK on.
+		 */
+		if (hm->extclk) {
+			unsigned long pre_rate = clk_get_rate(hm->extclk);
+			int clk_ret = clk_prepare_enable(hm->extclk);
+			unsigned long post_rate = clk_get_rate(hm->extclk);
+			dev_info(&client->dev,
+				 "  MCLK pre=%lu Hz, defensive clk_prepare_enable returned %d, post=%lu Hz\n",
+				 pre_rate, clk_ret, post_rate);
+		}
+
+		/*
 		 * Now that sensor is clocking the CSI-2 lane, ask intel_cvs to
 		 * fire HOST_SET_MIPI_CONFIG (0x0830) for IR/port-2. This is the
 		 * Windows ordering: sensor 0x0100=0x01 FIRST, bridge 0x830
@@ -812,6 +828,17 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 		} else {
 			dev_warn(&client->dev,
 				 "  intel_cvs symbol unavailable; port-2 forwarding NOT configured\n");
+		}
+
+		/*
+		 * TEST 2 (continued): log MCLK rate AFTER 0x830 too. If it went
+		 * to 0 here, the bridge's processing of 0x830 itself disabled
+		 * the clock. If it's still on, MCLK isn't the issue.
+		 */
+		if (hm->extclk) {
+			unsigned long after_rate = clk_get_rate(hm->extclk);
+			dev_info(&client->dev,
+				 "  MCLK after 0x830: %lu Hz\n", after_rate);
 		}
 
 		/* Lazy-enable IR LED only while streaming */
@@ -837,6 +864,10 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 
 		/* Cancel any pending AE-kick before sensor goes to standby */
 		cancel_delayed_work_sync(&hm->ae_kick_work);
+
+		/* Balance the defensive clk_prepare_enable() from set_stream(1) */
+		if (hm->extclk)
+			clk_disable_unprepare(hm->extclk);
 
 		/* Turn off IR LED before sensor goes to standby */
 		if (hm->ir_led) {

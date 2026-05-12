@@ -188,17 +188,55 @@ int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 			memcpy(&mipi_buf[2], data, copy_len);
 		}
 
-		count = i2c_master_send(client, (const char *)mipi_buf,
-					total_size);
+		/*
+		 * 2026-05-12 — split into Windows-equivalent 52-byte chunks.
+		 *
+		 * USBPcap analysis of Windows shows 0x830 is sent as 5 separate
+		 * I2C transactions of 52/52/52/52/48 bytes (matching the Lattice
+		 * USBIO_QUIRK_I2C_MAX_RW_LEN_52 chunking pattern). Linux currently
+		 * sends 256 bytes as ONE I2C transaction (it chunks at the USB
+		 * layer but NOT at the I2C protocol layer — bridge sees a single
+		 * 256-byte write).
+		 *
+		 * The bridge's HOST_SET_MIPI_CONFIG handler may be designed for
+		 * the chunked-transaction pattern. We replicate Windows's wire
+		 * behavior by issuing 5 separate i2c_master_send() calls. Each
+		 * is a complete I2C START + 52 (or 48) bytes + STOP cycle.
+		 *
+		 * The first chunk carries the opcode (0x08 0x30) + payload
+		 * length DWORD + checksum DWORD + the first 42 bytes of the
+		 * 176-byte payload. Chunks 2-4 carry 52 bytes of payload each.
+		 * Chunk 5 carries the final payload bytes + trailing zero-pad.
+		 */
+		{
+			const u32 CHUNK = 52;
+			u32 sent = 0;
+			int chunk_count = 0;
 
-		dev_info(cvs->dev,
-			 "%s: HOST_SET_MIPI_CONFIG sent %d/%d bytes (%s payload)",
-			 __func__, count, total_size, payload_label);
+			while (sent < total_size) {
+				u32 chunklen = min(CHUNK, total_size - sent);
+				count = i2c_master_send(client,
+							(const char *)mipi_buf + sent,
+							chunklen);
+				chunk_count++;
+				if (count != (int)chunklen) {
+					dev_warn(cvs->dev,
+						 "%s: chunk %d/%d (offset %u, %u bytes) send returned %d\n",
+						 __func__, chunk_count, 5,
+						 sent, chunklen, count);
+					devm_kfree(ctx->dev, mipi_buf);
+					return -EIO;
+				}
+				sent += chunklen;
+			}
+
+			dev_info(cvs->dev,
+				 "%s: HOST_SET_MIPI_CONFIG sent %u/%d bytes as %d chunks of <= %u (%s payload)",
+				 __func__, sent, total_size, chunk_count,
+				 CHUNK, payload_label);
+		}
 
 		devm_kfree(ctx->dev, mipi_buf);
-
-		if (count != (int)total_size)
-			return -EIO;
 		break;
 	}
 	case HOST_SET_MIPI_CONFIG_AUX: {

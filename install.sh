@@ -1,6 +1,23 @@
 #!/bin/bash
 #
-# Synaptics SVP7500 + Intel IPU7 camera fix pack — installer (v0.3)
+# Synaptics SVP7500 + Intel IPU7 camera fix pack — installer (v0.4)
+#
+# v0.4 adds (over v0.3):
+#   - intel-cvs: HOST_SET_MIPI_CONFIG (0x830) is now sent as 5 separate I2C
+#     transactions of 52/52/52/52/48 bytes (matching Windows USBPcap wire
+#     pattern exactly, instead of one 256-byte transaction split at USB layer)
+#   - Patched in-tree usbio.ko adding USBIO_QUIRK_I2C_ALLOW_400KHZ for
+#     Synaptics 06cb:0701 (matches Lattice NX33 quirk pattern; gets I2C from
+#     100kHz → 400kHz, eliminating "Invalid speed" log spam)
+#   - intel_cvs: new sysfs commands `cmd-NNNN` (raw 2-byte opcode probe),
+#     `set-vision`, `factory-reset` for further investigation
+#   - hm1092: 3 runtime-tunable module params for IR experimentation
+#     (mipi_ir_delay_ms, dump_regs_on_stream, ae_kick_period_ms)
+#
+# Note: IR streaming is still NOT working on Linux (gap is bridge-side and
+# appears to be in the secure firmware/CSE handshake path that's missing the
+# ivsc_pkg_himx1092_0.bin firmware blob). RGB camera (OV08X40) WORKS, twice
+# independently confirmed. See intel/ipu7-drivers#51 + #72 for full details.
 #
 # Restores RGB camera functionality on Linux for laptops with:
 #   - Intel IPU7 (Panther Lake or Lunar Lake)
@@ -188,6 +205,45 @@ install_dkms "int3472-patched" "1.0"  || true
 install_dkms "ipu-bridge-patched" "1.0" || true
 install_dkms "hm1092" "1.0"           || true
 
+# Patched in-tree usbio.ko (adds USBIO_QUIRK_I2C_ALLOW_400KHZ for Synaptics 06cb:0701)
+# Only install if (a) the bridge is present and (b) we have an MOK signing key.
+log ""
+log "Considering patched usbio.ko (in-tree module — adds 400KHz quirk for SVP7500)..."
+if ! lsusb -d 06cb:0701 >/dev/null 2>&1; then
+    warn "  Synaptics SVP7500 (06CB:0701) not present — skipping usbio patch"
+elif [[ ! -f /var/lib/dkms/mok.key ]] || [[ ! -f /var/lib/dkms/mok.pub ]]; then
+    warn "  No DKMS MOK key found at /var/lib/dkms/ — skipping usbio patch"
+    warn "  (the patched usbio.ko needs to be signed for Secure Boot)"
+else
+    USBIO_DIR="$SCRIPT_DIR/usbio-patch"
+    BACKUP_DIR=/var/cache/svp7500-fix-pack
+    mkdir -p "$BACKUP_DIR"
+
+    # Build out-of-tree against the running kernel
+    log "  building patched usbio.ko..."
+    if (cd "$USBIO_DIR" && make 2>&1 | tail -5); then
+        # Strip + sign + compress
+        strip --strip-debug "$USBIO_DIR/usbio.ko" 2>/dev/null || true
+        /lib/modules/"$KVER"/build/scripts/sign-file sha256 \
+            /var/lib/dkms/mok.key /var/lib/dkms/mok.pub "$USBIO_DIR/usbio.ko"
+        zstd -f --rm "$USBIO_DIR/usbio.ko" 2>&1 | tail -1
+
+        # Backup the in-tree original ONCE (preserves the very first one — never overwrites)
+        ORIG=/lib/modules/"$KVER"/kernel/drivers/usb/misc/usbio.ko.zst
+        if [[ ! -f "$BACKUP_DIR/usbio.ko.zst.orig" ]] && [[ -f "$ORIG" ]]; then
+            cp "$ORIG" "$BACKUP_DIR/usbio.ko.zst.orig"
+            ok "  backed up original usbio.ko.zst → $BACKUP_DIR/usbio.ko.zst.orig"
+        fi
+
+        # Install
+        cp "$USBIO_DIR/usbio.ko.zst" "$ORIG"
+        depmod -a
+        ok "  patched usbio.ko installed (revert: cp $BACKUP_DIR/usbio.ko.zst.orig $ORIG && depmod -a && reboot)"
+    else
+        warn "  usbio build failed — skipping (existing module unchanged, RGB still works without this patch)"
+    fi
+fi
+
 # Install udev rule
 log ""
 log "Installing udev rule..."
@@ -202,7 +258,7 @@ log "Installed DKMS modules:"
 dkms status | grep -E '(intel-cvs|hm1092|int3472|ipu-bridge)' || warn "No fix-pack DKMS modules showing as installed"
 
 echo ""
-ok "==== Install complete (v0.3) ===="
+ok "==== Install complete (v0.4) ===="
 echo ""
 echo "  Next steps:"
 echo "    1. REBOOT to load the new modules cleanly"
