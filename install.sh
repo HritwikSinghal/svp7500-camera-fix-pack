@@ -66,6 +66,51 @@ KHDR="/lib/modules/$KVER/build"
 [[ -d "$KHDR" ]] || die "Kernel headers not found at $KHDR. Install with: dnf install kernel-devel (Fedora) / pacman -S linux-headers (Arch) / apt install linux-headers-$(uname -r) (Debian)"
 ok "DKMS + kernel headers present"
 
+# Mandatory: back up vmlinuz + initramfs before touching anything kernel-side.
+# Even though our DKMS modules are camera-only (not on the boot path),
+# any DKMS install + udev change can theoretically affect boot. Cheap insurance.
+log ""
+log "Backing up vmlinuz + initramfs before install..."
+BAK_TS=$(date +%Y%m%d-%H%M%S)
+BAK_SUFFIX=".pre-svp7500-fix.${BAK_TS}.bak"
+BACKED_UP=0
+
+# vmlinuz (kernel image) — common locations
+for vmlinuz in /boot/vmlinuz-"$KVER" /boot/vmlinuz-linux /boot/vmlinuz-linux-* /boot/vmlinuz; do
+    if [[ -f "$vmlinuz" && ! -L "$vmlinuz" ]]; then
+        cp -a "$vmlinuz" "${vmlinuz}${BAK_SUFFIX}"
+        ok "  vmlinuz   → ${vmlinuz}${BAK_SUFFIX}"
+        BACKED_UP=$((BACKED_UP + 1))
+    fi
+done
+
+# initramfs (multiple distro naming conventions)
+for initrd in /boot/initramfs-"$KVER".img /boot/initramfs-linux*.img /boot/initrd.img-"$KVER" /boot/initrd.img-* /boot/initramfs*.img; do
+    if [[ -f "$initrd" && "$initrd" != *.bak ]]; then
+        cp -a "$initrd" "${initrd}${BAK_SUFFIX}"
+        ok "  initramfs → ${initrd}${BAK_SUFFIX}"
+        BACKED_UP=$((BACKED_UP + 1))
+    fi
+done
+
+if [[ $BACKED_UP -eq 0 ]]; then
+    warn "  Could not auto-detect kernel/initramfs files to back up."
+    warn "  You probably have a non-standard /boot layout."
+    warn "  Strongly recommend backing up manually before continuing."
+    warn "  Press Ctrl-C now to abort, or wait 10 seconds to continue..."
+    sleep 10
+else
+    ok "Backed up $BACKED_UP file(s). Restore: cp <file>${BAK_SUFFIX} <file> if needed."
+fi
+
+# Bonus: if user has snapper, take a system snapshot too
+if command -v snapper >/dev/null 2>&1 && snapper -c root list >/dev/null 2>&1; then
+    if snapper -c root create --description "pre-svp7500-camera-fix-pack" 2>/dev/null; then
+        ok "Snapper Btrfs snapshot created (root config)"
+    fi
+fi
+log ""
+
 # Check for SVP7500 hardware
 if lsusb -d 06cb:0701 >/dev/null 2>&1; then
     ok "Synaptics SVP7500 (06CB:0701) detected"

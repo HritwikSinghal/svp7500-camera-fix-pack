@@ -30,6 +30,30 @@ Likely also helps (untested by us, please report):
 
 ## Quick install
 
+> 🛟 **Back up your kernel + initramfs first.** DKMS modules can occasionally break boot if they fail to load and something on the boot path depends on them. These camera modules shouldn't be on the boot path, but be safe:
+>
+> ```bash
+> sudo cp /boot/vmlinuz-$(uname -r){,.pre-svp7500-fix.bak}
+> sudo cp /boot/initramfs-$(uname -r).img{,.pre-svp7500-fix.bak}  # Fedora/RHEL
+> # OR
+> sudo cp /boot/initrd.img-$(uname -r){,.pre-svp7500-fix.bak}     # Debian/Ubuntu
+> # OR (Arch / CachyOS)
+> sudo cp /boot/initramfs-linux*.img{,.pre-svp7500-fix.bak}
+> ```
+>
+> If you're on Btrfs with `snapper`, just take a snapshot:
+> `sudo snapper create --description "pre-svp7500-fix"`
+>
+> **Recovery if something breaks:** boot to your previous kernel entry (most bootloaders keep one), then:
+> ```bash
+> sudo dkms remove -m intel-cvs -v 1.0 --all
+> sudo dkms remove -m hm1092 -v 1.0 --all
+> sudo dkms remove -m int3472-patched -v 1.0 --all
+> sudo dkms remove -m ipu-bridge-patched -v 1.0 --all
+> sudo rm -f /etc/udev/rules.d/99-svp7500-no-autosuspend.rules
+> sudo reboot
+> ```
+
 Requires DKMS and kernel headers:
 ```bash
 # Fedora
