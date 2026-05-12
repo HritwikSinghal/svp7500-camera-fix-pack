@@ -2,11 +2,19 @@
 
 Restore RGB camera functionality on Linux for laptops with the Synaptics SVP7500 CVS bridge (USB `06CB:0701`) and Intel IPU7 (Panther Lake / Lunar Lake).
 
+> ⚠️ **Testing scope:** All testing was done on **CachyOS** with a custom-built **linux-cachyos-susfix 7.0.5** kernel (CachyOS's `linux-cachyos` source plus our own kernel patch for the `ipu7_pci_remove` ordering bug). The DKMS modules themselves should be distro-agnostic (just C code against the kernel API), so Fedora / Arch / Debian / Ubuntu *should* work — **but we haven't tested those personally.** If you try it on another distro, please report back via the issue tracker.
+>
+> Specifically untested:
+> - Fedora 43/44 (regular workstation) — should work, kernel version compatible
+> - Fedora 44 Silverblue — DKMS on an immutable OS is finicky; you'll likely need `rpm-ostree install dkms kernel-devel` followed by a reboot before running our installer. Layering DKMS modules on Silverblue is known-awkward.
+> - Ubuntu / Debian — should work with `linux-headers-$(uname -r)`
+> - Stock Arch / EndeavourOS — should work; we run a custom kernel but the DKMS modules don't depend on those custom patches
+
 ## Affected hardware
 
-Confirmed: Dell XPS 16 PB16250 (Panther Lake)
+Confirmed: Dell XPS 16 PB16250 (Panther Lake) on CachyOS
 
-Likely also helps:
+Likely also helps (untested by us, please report):
 - Dell Latitude 9440 / 7440 / 7450
 - Lenovo ThinkPad X9
 - Dell Pro Plus 14 PB14250 / Pro Max 16 MA16250
