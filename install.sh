@@ -110,6 +110,28 @@ KHDR="/lib/modules/$KVER/build"
 [[ -d "$KHDR" ]] || die "Kernel headers not found at $KHDR. Install with: dnf install kernel-devel (Fedora) / pacman -S linux-headers (Arch) / apt install linux-headers-$(uname -r) (Debian)"
 ok "DKMS + kernel headers present"
 
+# Detect what compiler the running kernel was built with.  Our DKMS configs
+# default to clang/LLVM (matches CachyOS), but vanilla Arch/Fedora/Debian
+# kernels are GCC-built, and clang refuses to parse GCC-specific flags like
+# -mpreferred-stack-boundary=3 and -mindirect-branch=thunk-extern.
+# We rewrite each dkms.conf MAKE line at install time to match the kernel.
+KCC="gcc"  # safe default
+if [[ -f "$KHDR/.config" ]]; then
+    if grep -q '^CONFIG_CC_IS_CLANG=y' "$KHDR/.config" 2>/dev/null; then
+        KCC="clang"
+    fi
+elif grep -qi 'clang' /proc/version 2>/dev/null; then
+    KCC="clang"
+fi
+log "Kernel compiler detected: $KCC"
+
+# Two flag-strings we'll splice into MAKE lines:
+if [[ "$KCC" = "clang" ]]; then
+    CC_FLAGS="CC=clang LD=ld.lld LLVM=1"
+else
+    CC_FLAGS=""  # let kbuild use its default (gcc)
+fi
+
 # Mandatory: back up vmlinuz + initramfs before touching anything kernel-side.
 # Even though our DKMS modules are camera-only (not on the boot path),
 # any DKMS install + udev change can theoretically affect boot. Cheap insurance.
@@ -186,6 +208,40 @@ install_dkms() {
     fi
     cp -a "$srcdir" "/usr/src/"
 
+    # Rewrite MAKE/CLEAN lines to match the kernel's compiler.
+    # Source dkms.conf hardcodes "CC=clang LD=ld.lld LLVM=1" or "CC=clang LLVM=1";
+    # strip that out and replace with $CC_FLAGS (empty for gcc kernels).
+    local dst="/usr/src/$name-$version/dkms.conf"
+    if [[ -f "$dst" ]]; then
+        sed -i \
+            -e "s| CC=clang LD=ld\.lld LLVM=1||g" \
+            -e "s| CC=clang LLVM=1||g" \
+            "$dst"
+        if [[ -n "$CC_FLAGS" ]]; then
+            # Re-add the appropriate flag block before " modules" / " clean"
+            sed -i \
+                -e "s| modules\"| $CC_FLAGS modules\"|g" \
+                -e "s| clean\"| $CC_FLAGS clean\"|g" \
+                "$dst"
+        fi
+        log "  dkms.conf rewritten for $KCC kernel"
+    fi
+
+    # Same treatment for the in-tree Makefile (used by standalone builds + DKMS)
+    local mk="/usr/src/$name-$version/Makefile"
+    if [[ -f "$mk" ]]; then
+        sed -i \
+            -e "s| CC=clang LD=ld\.lld LLVM=1||g" \
+            -e "s| CC=clang LLVM=1||g" \
+            "$mk"
+        if [[ -n "$CC_FLAGS" ]]; then
+            sed -i \
+                -e "s|M=\$(CURDIR) modules|M=\$(CURDIR) $CC_FLAGS modules|g" \
+                -e "s|M=\$(CURDIR) clean|M=\$(CURDIR) $CC_FLAGS clean|g" \
+                "$mk"
+        fi
+    fi
+
     # Add + install
     dkms add "$name/$version" 2>/dev/null || true
     if dkms install "$name/$version" -k "$KVER"; then
@@ -219,9 +275,16 @@ else
     BACKUP_DIR=/var/cache/svp7500-fix-pack
     mkdir -p "$BACKUP_DIR"
 
-    # Build out-of-tree against the running kernel
+    # Build out-of-tree against the running kernel.
+    # The Makefile defaults to clang; override via make's command-line for
+    # GCC-built kernels (Arch/Fedora/Debian stock).
     log "  building patched usbio.ko..."
-    if (cd "$USBIO_DIR" && make 2>&1 | tail -5); then
+    if [[ "$KCC" = "clang" ]]; then
+        BUILD_CMD="make"
+    else
+        BUILD_CMD="make CC=gcc LD=ld LLVM="
+    fi
+    if (cd "$USBIO_DIR" && $BUILD_CMD 2>&1 | tail -5); then
         # Strip + sign + compress
         strip --strip-debug "$USBIO_DIR/usbio.ko" 2>/dev/null || true
         /lib/modules/"$KVER"/build/scripts/sign-file sha256 \
