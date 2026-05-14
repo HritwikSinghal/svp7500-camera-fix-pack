@@ -12,12 +12,15 @@ Restore RGB camera functionality on Linux for laptops with the Synaptics SVP7500
 
 ## Affected hardware
 
-Confirmed: Dell XPS 16 PB16250 (Panther Lake) on CachyOS
+Confirmed working:
+- Dell XPS 16 DA16260 (Panther Lake) on CachyOS — primary dev hardware
+- Dell XPS 16 DA16260 (Panther Lake) on Fedora 44 Silverblue — independently confirmed by @tverhaeghe (intel/vision-drivers#37)
+- Dell Pro 14 PB14250 (Lunar Lake) on Arch — install confirmed by @acmodeu (intel/ipu7-drivers#26), streaming TBD
 
 Likely also helps (untested by us, please report):
 - Dell Latitude 9440 / 7440 / 7450
 - Lenovo ThinkPad X9
-- Dell Pro Plus 14 PB14250 / Pro Max 16 MA16250
+- Dell Pro Max 16 MA16250
 - ASUS Vivobook X1407Q (Snapdragon X — different host, same sensor)
 - Any laptop with Intel IPU7 + Synaptics SVP7500 + OV08x40/HM1092 sensors
 

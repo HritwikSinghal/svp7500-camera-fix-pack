@@ -25,9 +25,11 @@
 #   - OmniVision OV08x40 RGB sensor + Himax HM1092 IR sensor
 #
 # Tested platforms (confirmed working):
-#   - Dell XPS 16 PB16250 / Panther Lake (CachyOS 7.0.5-2-cachyos-susfix)
+#   - Dell XPS 16 DA16260 / Panther Lake (CachyOS 7.0.5-2-cachyos-susfix)
 #   - Dell XPS 16 DA16260 / Panther Lake (Fedora 44 Silverblue 7.0.4-200, via
 #     @tverhaeghe intel/vision-drivers#37 comment 4433909742, RGB-only)
+#   - Dell Pro 14 PB14250 / Lunar Lake (Arch 7.0.5-arch1-1, via @acmodeu
+#     intel/ipu7-drivers#26, v0.5+ install confirmed, streaming TBD)
 #
 # Should also help (untested, please report):
 #   - Dell Latitude 9440/7440/7450, Lenovo ThinkPad X9,
