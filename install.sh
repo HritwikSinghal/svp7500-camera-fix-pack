@@ -93,6 +93,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KVER="${KVER:-$(uname -r)}"
 KEEP_GOING=${KEEP_GOING:-0}
 
+# Detect actual installer version from git (preferred) or fall back to "unknown"
+# so the "Install complete" message reflects what was actually run.  Reported by
+# @acmodeu in intel/ipu7-drivers#26 — previous hardcode of "v0.4" was misleading.
+if command -v git >/dev/null 2>&1 && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    PACK_VERSION=$(git -C "$SCRIPT_DIR" describe --tags --dirty --always 2>/dev/null || echo "unknown")
+else
+    PACK_VERSION="unknown"
+fi
+
 log()  { echo -e "\033[1;34m[*]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
@@ -323,7 +332,7 @@ log "Installed DKMS modules:"
 dkms status | grep -E '(intel-cvs|hm1092|int3472|ipu-bridge)' || warn "No fix-pack DKMS modules showing as installed"
 
 echo ""
-ok "==== Install complete (v0.4) ===="
+ok "==== Install complete ($PACK_VERSION) ===="
 echo ""
 echo "  Next steps:"
 echo "    1. REBOOT to load the new modules cleanly"
