@@ -104,7 +104,12 @@ If the camera does not show up, check `sudo dmesg | grep -E 'Intel CVS|hm1092|ov
 - 198-register init sequence reverse-engineered from a Windows USBPcap during Hello face auth.
 - Lazy IR LED management: LED is OFF when the sensor is in standby, only turns ON during streaming. Matches Windows behavior. Stock implementations leave the LED ON 24/7 after module load.
 
-### 5. udev rule
+### 5. `ov05c10` DKMS
+- RGB sensor driver for boards that pair the SVP7500 bridge with the **OV05C10** (`OVTI05C1`) sensor — e.g. the **Dell Pro Plus 14 PB14250** — instead of the OV08x40 used on the DA16260.
+- The driver is the out-of-tree Intel one from [`intel/ipu6-drivers`](https://github.com/intel/ipu6-drivers) (`drivers/media/i2c/ov05c10.c`); it was never mainlined, so affected boards have no RGB camera until it's installed. The bridge half already enumerates `OVTI05C1` — this supplies the missing sensor driver.
+- Packaged as DKMS so it survives kernel upgrades. Builds clean against 6.18 / 7.0 / 7.1.
+
+### 6. udev rule
 - Disables USB autosuspend on the SVP7500 device. Bridge firmware appears to have issues with power state transitions; keeping it always-on prevents some failure modes.
 
 ## Why this needed reverse engineering at all

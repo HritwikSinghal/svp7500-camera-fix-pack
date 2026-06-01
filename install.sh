@@ -62,7 +62,11 @@
 #        - ae_kick_period_ms      (periodic 0x0104=0x01 every N ms)
 #        Tune via /sys/module/hm1092/parameters/* — no rebuild needed.
 #      * NEW v0.3: sysfs 'stream' attr at /sys/bus/i2c/.../i2c-HIMX1092:00/
-#   5. udev rule — disable USB autosuspend for SVP7500
+#   5. ov05c10 DKMS — RGB sensor driver for PB14250-class boards (OVTI05C1)
+#      * Out-of-tree driver from intel/ipu6-drivers (never mainlined)
+#      * For boards pairing the SVP7500 bridge with the OV05C10 RGB sensor
+#        (e.g. Dell Pro Plus 14 PB14250). DA16260 uses ov08x40, not this.
+#   6. udev rule — disable USB autosuspend for SVP7500
 #      (bridge firmware can wedge on power state transitions)
 #
 # Status:
@@ -271,6 +275,7 @@ install_dkms "intel-cvs" "1.0"        || true
 install_dkms "int3472-patched" "1.0"  || true
 install_dkms "ipu-bridge-patched" "1.0" || true
 install_dkms "hm1092" "1.0"           || true
+install_dkms "ov05c10" "1.0"          || true   # RGB sensor for PB14250 (OVTI05C1) — out-of-tree, from intel/ipu6-drivers
 
 # Patched in-tree usbio.ko (adds USBIO_QUIRK_I2C_ALLOW_400KHZ for Synaptics 06cb:0701)
 # Only install if (a) the bridge is present and (b) we have an MOK signing key.
