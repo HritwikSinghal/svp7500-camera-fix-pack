@@ -1,0 +1,99 @@
+--- a/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
++++ b/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
+@@ -1052,19 +1052,61 @@
+ 		struct ipu_psys_event ev;
+ 	} karg;
+ 	struct ipu7_psys_fh *fh = file->private_data;
++	struct ipu7_psys *psys = fh->psys;
++	struct device *pmdev = &psys->adev->auxdev.dev;
++	unsigned long ready_flags;
++	int ready_state;
+ 	long err = 0;
+ 	void __user *up = (void __user *)arg;
+ 	bool copy = (cmd != IPU_IOC_MAPBUF && cmd != IPU_IOC_UNMAPBUF &&
+ 		     cmd != IPU_IOC_GRAPH_CLOSE);
+ 
++	/*
++	 * Defensive: synchronously resume the device before any ioctl reaches
++	 * the FW path. Without this, userspace can hit ipu7_fw_psys_graph_open
++	 * (and friends) immediately after system resume, while syscom queue
++	 * memory is still being torn down / re-mapped during firmware reload.
++	 * Result: get_token returns a stale-looking pointer, the next memset
++	 * faults on an unmapped page, and we oops with IRQs off then reboot.
++	 *
++	 * pm_runtime_resume_and_get drives psys_runtime_pm_resume to completion
++	 * (HW init, FW boot, fw_psys_open, ready=1). If resume fails, propagate
++	 * the error rather than dereferencing stale state.
++	 *
++	 * Belt and braces: also verify psys->ready is set after resume - a
++	 * cleanly-failed resume can leave the device powered but FW not ready.
++	 */
++	err = pm_runtime_resume_and_get(pmdev);
++	if (err < 0) {
++		dev_warn_ratelimited(&psys->dev,
++				     "ioctl: resume failed (%ld), refusing cmd 0x%x\n",
++				     err, cmd);
++		return err;
++	}
++
++	spin_lock_irqsave(&psys->ready_lock, ready_flags);
++	ready_state = psys->ready;
++	spin_unlock_irqrestore(&psys->ready_lock, ready_flags);
++	if (!ready_state) {
++		dev_warn_ratelimited(&psys->dev,
++				     "ioctl: psys not ready after resume, refusing cmd 0x%x\n",
++				     cmd);
++		pm_runtime_put(pmdev);
++		return -ESHUTDOWN;
++	}
++
+ 	if (copy) {
+-		if (_IOC_SIZE(cmd) > sizeof(karg))
++		if (_IOC_SIZE(cmd) > sizeof(karg)) {
++			pm_runtime_put(pmdev);
+ 			return -ENOTTY;
++		}
+ 
+ 		if (_IOC_DIR(cmd) & _IOC_WRITE) {
+ 			err = copy_from_user(&karg, up, _IOC_SIZE(cmd));
+-			if (err)
++			if (err) {
++				pm_runtime_put(pmdev);
+ 				return -EFAULT;
++			}
+ 		}
+ 	}
+ 
+@@ -1098,6 +1140,8 @@
+ 		break;
+ 	}
+ 
++	pm_runtime_put(pmdev);
++
+ 	if (err)
+ 		return err;
+ 
+@@ -1208,16 +1252,13 @@
+ 
+ static int psys_suspend(struct device *dev)
+ {
+-	struct ipu7_psys *psys = dev_get_drvdata(dev);
+-	unsigned long flags;
+-	int ret = 0;
+-
+-	spin_lock_irqsave(&psys->ready_lock, flags);
+-	if (psys->ready)
+-		ret = -EBUSY;
+-	spin_unlock_irqrestore(&psys->ready_lock, flags);
+-
+-	return ret;
++	/*
++	 * Original returned -EBUSY whenever psys->ready was set, blocking
++	 * s2idle suspend after any camera use. Force the same teardown as
++	 * runtime PM suspend instead. Companion to staging ipu7 pci_remove
++	 * ordering fix which prevents find_iova NULL deref on MMU cleanup.
++	 */
++	return psys_runtime_pm_suspend(dev);
+ }
+ 
+ static const struct dev_pm_ops psys_pm_ops = {

@@ -1,0 +1,7 @@
+# The HM1092 IR flood illuminator is exposed by INT3472 as a LED class device.
+# Howdy's face-recognition process runs as the *unprivileged user* when invoked
+# from a lock screen / PAM stack, so root-only sysfs means the illuminator never
+# fires and every frame comes back too dark to detect a face. Grant the video
+# group write access -- the same group that already owns /dev/video* here.
+SUBSYSTEM=="leds", KERNEL=="*ir_flood_led*", ACTION=="add|change", \
+    RUN+="/bin/chgrp video /sys%p/brightness", RUN+="/bin/chmod 0664 /sys%p/brightness"

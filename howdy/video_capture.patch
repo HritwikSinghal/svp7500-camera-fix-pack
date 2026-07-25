@@ -1,0 +1,47 @@
+--- /usr/lib/howdy/recorders/video_capture.py.pre-ir-20260725	2026-04-16 09:38:46.873161166 -0400
++++ /usr/lib/howdy/recorders/video_capture.py	2026-07-25 09:25:37.823840072 -0400
+@@ -119,9 +119,42 @@
+ 				self.config.get("video", "device_format", fallback="v4l2")
+ 			)
+ 
++		elif recording_plugin == "ir":
++			# Raw V4L2 reader for the HM1092 IR sensor on Intel IPU7.
++			# Bypasses libcamera/PipeWire, which debayer this monochrome sensor
++			# (it is tagged SGRBG10) and renegotiate the stream away from its
++			# native 648x368. Also drives the IR flood illuminator, which the
++			# sensor driver cannot because INT3472 owns that GPIO.
++			from recorders.ir_reader import ir_reader
++			self.internal = ir_reader(
++				self.config.get("video", "device_path")
++			)
++
+ 		elif recording_plugin == "pipewire":
+-			# Use GStreamer pipeline through PipeWire for cameras without V4L2 RGB output
+-			gst_pipeline = 'pipewiresrc ! videoflip method=rotate-180 ! videoconvert ! video/x-raw,format=BGR ! appsink'
++			# Use GStreamer pipeline through PipeWire for cameras without V4L2 RGB output.
++			#
++			# pipewire_target: PipeWire node.name to capture from. Without it
++			# pipewiresrc grabs the DEFAULT source, which is the RGB camera --
++			# so the IR sensor must be named explicitly. Find it with:
++			#     pw-cli ls Node | grep -B2 'media.class = "Video/Source"'
++			# The HM1092 IR sensor is libcamera_input.__SB_.LNK0 on this machine.
++			#
++			# pipewire_flip: videoflip method, or "none". The RGB camera needs
++			# rotate-180; the HM1092 already applies H+V flip in hardware
++			# (register 0x0101=0x03), so it must NOT be flipped again.
++			target = self.config.get("video", "pipewire_target", fallback="").strip()
++			flip = self.config.get("video", "pipewire_flip", fallback="rotate-180").strip()
++
++			src = "pipewiresrc"
++			if target:
++				src += ' target-object="{}"'.format(target)
++
++			stages = [src]
++			if flip and flip.lower() != "none":
++				stages.append("videoflip method={}".format(flip))
++			stages += ["videoconvert", "video/x-raw,format=BGR", "appsink"]
++
++			gst_pipeline = " ! ".join(stages)
+ 			self.internal = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+ 
+ 		else:

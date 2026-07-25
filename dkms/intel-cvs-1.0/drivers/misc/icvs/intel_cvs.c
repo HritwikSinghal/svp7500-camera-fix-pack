@@ -14,12 +14,45 @@
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/vmalloc.h>
+#include <linux/printk.h>
+#include <linux/string.h>
 
 #include "cvs_gpio.h"
 #include "intel_cvs_update.h"
 #include "rgb_hello_init.h"
 
 struct intel_cvs *cvs;
+
+/*
+ * Diagnostic: skip the probe-time HOST_SET_MIPI_CONFIG (0x830) send.
+ *
+ * Hypothesis: bridge state machine treats the FIRST 0x830 of a session as
+ * "the real config" and silently no-ops subsequent 0x830 calls. If true,
+ * our probe-time SSDB-derived 0x830 (which targets port 2 with placeholder
+ * lane values) latches the bridge into a wrong state, and our later
+ * verbatim-Windows IR 0x830 from hm1092_set_stream is ignored.
+ *
+ * With skip_probe_mipi=1, no probe-time 0x830 is sent. Then the FIRST-EVER
+ * 0x830 of the session is the verbatim IR payload from cvs_send_mipi_ir_config()
+ * (called by hm1092_set_stream(1) on first IR STREAMON).
+ *
+ * Side effect: probe-time `Transfer of ownership success` may fail because
+ * the GPIO REQ/RESP handshake might depend on bridge being post-config. RGB
+ * streaming may also break — we don't yet know if libcamera's ov08x40 path
+ * triggers any bridge config. Diagnostic-only.
+ */
+static bool skip_fw_reset = true;
+module_param(skip_fw_reset, bool, 0644);
+MODULE_PARM_DESC(skip_fw_reset,
+	"Skip the rst-GPIO pulse in remove(). Intel's mainlined cvs driver carries a "
+	"SKIP_FW_RESET quirk for Synaptics SVP7xxx because pulsing rst on those parts "
+	"wedges the bridge until a USB power-cycle. Default true on this platform.");
+
+static bool skip_probe_mipi;
+module_param(skip_probe_mipi, bool, 0644);
+MODULE_PARM_DESC(skip_probe_mipi,
+	"Skip the probe-time HOST_SET_MIPI_CONFIG so first 0x830 of session is "
+	"the IR variant from hm1092 stream-start (diagnostic for first-call-wins theory)");
 
 /*
  * cvs_replay_rgb_hello_init - replay the verbatim Windows-Hello RGB sensor
@@ -59,7 +92,7 @@ struct intel_cvs *cvs;
  * Windows use during Hello unlock USBPcap. Per RE of Vision.sys, the bridge
  * accepts these but their effect is undocumented. Long-shot probe.
  */
-int cvs_send_2byte_cmd(u16 cmd)
+static int cvs_send_2byte_cmd(u16 cmd)
 {
 	struct i2c_client *i2c;
 	u8 buf[2];
@@ -75,6 +108,17 @@ int cvs_send_2byte_cmd(u16 cmd)
 		 __func__, cmd, cnt);
 	return cnt == 2 ? 0 : -EIO;
 }
+
+/*
+ * NOTE 2026-05-13: I added a cvs_set_link_owner() here earlier today that
+ * sent 0x0831 as an I2C opcode with a u32 owner parameter.  That was based
+ * on a misread of Miguel Vadillo's upstream series — turns out
+ * ICVS_HOST_SENSOR_OWNER (0x0831) is dispatched in cvs_send() to a GPIO
+ * toggle of req/resp pins, NOT to i2c_master_send.  The 0x0831 enum value
+ * never goes over I2C.  Our existing intel_cvs already does the correct
+ * GPIO handshake at probe (visible as "Transfer of ownership success" in
+ * dmesg), so no extra wiring needed here.  Removed the bogus function.
+ */
 
 int cvs_send_mipi_ir_config(void)
 {
@@ -108,7 +152,7 @@ int cvs_send_mipi_ir_config(void)
 }
 EXPORT_SYMBOL_GPL(cvs_send_mipi_ir_config);
 
-int cvs_replay_rgb_hello_init(void)
+static int cvs_replay_rgb_hello_init(void)
 {
 	struct i2c_client *i2c;
 	int i, ret;
@@ -219,7 +263,7 @@ static int find_oem_prod_id(acpi_handle handle, const char *method_name,
 static int cvs_common_probe(struct device *dev, bool is_i2c)
 {
 	struct intel_cvs *icvs;
-	acpi_handle handle;
+	acpi_handle handle = NULL;
 	int ret = -ENODEV;
 
 	icvs = devm_kzalloc(dev, sizeof(struct intel_cvs), GFP_KERNEL);
@@ -319,6 +363,15 @@ static int cvs_common_probe(struct device *dev, bool is_i2c)
 					goto exit;
 			}
 
+			/*
+			 * 2026-05-13: Wire-format of SET_HOST_IDENTIFIER is
+			 * hardcoded inside cvs_write_i2c() (intel_cvs_update.c)
+			 * — the data/len args are ignored for this opcode.
+			 * That hardcoded payload was missing privacy_led_host=1
+			 * which Miguel Vadillo's upstream driver sends for
+			 * Synaptics SVP7xxx per the quirks table.  Fix is in
+			 * cvs_write_i2c case SET_HOST_IDENTIFIER (flip one bit).
+			 */
 			ret = cvs_write_i2c(SET_HOST_IDENTIFIER, NULL, 0);
 			if (ret) {
 				dev_err(cvs->dev, "%s:set_host_identifier cmd failed", __func__);
@@ -340,7 +393,10 @@ static int cvs_common_probe(struct device *dev, bool is_i2c)
 			 * len > 0. sysfs 'mipi' passes data=NULL/len=0 which
 			 * triggers verbatim Windows payload for post-probe tests.
 			 */
-			if (icvs->cv_fw_capability.dev_capability &
+			if (skip_probe_mipi) {
+				dev_info(cvs->dev,
+					 "skip_probe_mipi=1 — NOT sending probe-time HOST_SET_MIPI_CONFIG\n");
+			} else if (icvs->cv_fw_capability.dev_capability &
 			    HOST_MIPI_CONFIG_REQUIRED_MASK) {
 				/*
 				 * MIPI config = SSDB structure starting at offset 0x14.
@@ -496,7 +552,11 @@ static void cvs_common_remove(struct device *dev, bool is_i2c)
 			}
 
 			/* reset vision chip */
-			if (cvs_reset_cv_device()) {
+			if (skip_fw_reset) {
+				dev_info(cvs->dev,
+					 "%s:skipping rst pulse (SKIP_FW_RESET quirk, SVP7xxx)\n",
+					 __func__);
+			} else if (cvs_reset_cv_device()) {
 				dev_err(cvs->dev, "%s:CV reset fail after flash", __func__);
 				return;
 			}
@@ -594,6 +654,33 @@ int cvs_acquire_camera_sensor_internal(void)
 	cvs->int_ref_count++;
 	return 0;
 }
+
+#ifdef DEBUG_CVS
+/*
+ * Reproduce the captured Windows ownership edge without the driver's normal
+ * 100 ms response-poll delay.  Windows resumes sensor writes about 11 ms
+ * after driving REQ low; the synchronous acquire helper therefore cannot be
+ * used by a timing-faithful replay.  This diagnostic path changes the same
+ * GPIO and bookkeeping, but intentionally leaves response validation to the
+ * subsequent captured traffic and CVS state read.
+ */
+static int cvs_acquire_camera_sensor_edge_only(void)
+{
+	if (!cvs)
+		return -EINVAL;
+
+	if (cvs->icvs_state == CV_FW_DOWNLOADING_STATE ||
+	    cvs->icvs_state == CV_FW_FLASHING_STATE)
+		return -EBUSY;
+
+	if (cvs->owner != CVS_CAMERA_IPU)
+		gpiod_set_value_cansleep(cvs->req, 0);
+
+	cvs->owner = CVS_CAMERA_IPU;
+	cvs->int_ref_count++;
+	return 0;
+}
+#endif
 
 int cvs_release_camera_sensor_internal(void)
 {
@@ -746,14 +833,39 @@ static ssize_t cmd_store(struct device *dev, struct device_attribute *attr,
 	}
 	else if (sysfs_streq(buf, "acquire")) {
 		/*
-		 * Manually transfer sensor ownership to CVS bridge. Probe-time
-		 * call was deferred so hm1092 can probe via direct sensor I2C.
+		 * Manually transfer sensor ownership from CVS firmware to the
+		 * host/IPU (REQ low, wait for RESP low).
 		 */
 		int r = cvs_acquire_camera_sensor_internal();
 		if (r == 0)
 			cvs->icvs_sensor_state = CV_SENSOR_VISION_ACQUIRED_STATE;
 		dev_info(cvs->dev,
 			 "%s: manual acquire_camera_sensor returned %d",
+			 __func__, r);
+	}
+	else if (sysfs_streq(buf, "acquire-edge")) {
+		/* Capture-faithful REQ-low edge: do not block 100 ms polling RESP. */
+		int r = cvs_acquire_camera_sensor_edge_only();
+		if (r == 0)
+			cvs->icvs_sensor_state = CV_SENSOR_VISION_ACQUIRED_STATE;
+		dev_info(cvs->dev,
+			 "%s: immediate acquire edge returned %d",
+			 __func__, r);
+	}
+	else if (sysfs_streq(buf, "release")) {
+		/*
+		 * Diagnostic counterpart to "acquire": return ownership to CVS
+		 * firmware (REQ high, wait for RESP high).  Windows Hello starts
+		 * HM1092 while CVS owns the sensor, then performs the acquire edge
+		 * roughly 60 ms after MODE_SELECT=1.  Exposing both transitions
+		 * lets the capture replay reproduce that ordering without changing
+		 * the normal probe path.
+		 */
+		int r = cvs_release_camera_sensor_internal();
+		if (r == 0)
+			cvs->icvs_sensor_state = CV_SENSOR_RELEASED_STATE;
+		dev_info(cvs->dev,
+			 "%s: manual release_camera_sensor returned %d",
 			 __func__, r);
 	}
 	else if (sysfs_streq(buf, "mipi")) {
@@ -811,12 +923,82 @@ static ssize_t cmd_store(struct device *dev, struct device_attribute *attr,
 	}
 	else if (sysfs_streq(buf, "factory-reset")) {
 		/*
-		 * FACTORY_RESET (0x0831) — untested upstream opcode. May clear
-		 * a stuck internal state preventing port-2 forwarding. Safe to
-		 * try once at idle (state=0x06).
+		 * NOTE 2026-05-13: This was mislabeled.  0x0831 is NOT factory
+		 * reset — it is ICVS_HOST_SENSOR_OWNER (CSI-2 link ownership
+		 * transfer) per Miguel Vadillo's upstream CVS series.  Sending
+		 * 2 bytes (no parameter) is wrong wire format and is what
+		 * historically wedged the bridge.  Use set-owner-host /
+		 * set-owner-cvs below instead.  Keeping this command as a
+		 * no-op-with-warning so older scripts don't silently
+		 * regress, but it intentionally does nothing.
 		 */
-		int r = cvs_send_2byte_cmd(0x0831);
-		dev_info(cvs->dev, "%s: factory-reset returned %d", __func__, r);
+		dev_warn(cvs->dev,
+			 "%s: 'factory-reset' is deprecated — 0x0831 is HOST_SENSOR_OWNER, not factory reset; use set-owner-host / set-owner-cvs\n",
+			 __func__);
+	}
+	/*
+	 * 2026-05-13: 'set-host-id-svp7xxx' sysfs command removed.
+	 * SET_HOST_IDENTIFIER is a one-shot init opcode — sending it
+	 * mid-session wedges the bridge (Bulk out failed: -110).
+	 * The host_id value is now built correctly inside cvs_write_i2c
+	 * and sent at probe time, so no runtime command is needed.
+	 */
+	else if (strncmp(buf, "read-", 5) == 0) {
+		/*
+		 * Generic READ path:  echo read-NNNN[-LEN] > cmd
+		 *
+		 * Sends the 2-byte opcode and reads LEN bytes back via
+		 * cvs_read_i2c (magic-number framing handled in there), then
+		 * hexdumps the reply to dmesg. Reads are non-destructive, so
+		 * unlike the write-side scans this is a SAFE way to probe
+		 * opcodes the driver never issues -- notably the gaps in
+		 * enum cvs_command: 0x0803, 0x0806 and 0x082f. Until now the
+		 * only failure signal we had was silence; a real reply (or a
+		 * real error code) is a new information channel.
+		 *
+		 * LEN is decimal, defaults to 4, clamped to sizeof(rbuf).
+		 */
+		u16 op = 0;
+		unsigned int len = 4;
+		char tmp[16], *dash;
+		u8 rbuf[256];
+		size_t l;
+		int rc;
+		const char *p = buf + 5;
+
+		if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+			p += 2;
+		strscpy(tmp, p, sizeof(tmp));
+		l = strlen(tmp);
+		while (l && (tmp[l - 1] == '\n' || tmp[l - 1] == ' '))
+			tmp[--l] = '\0';
+
+		dash = strchr(tmp, '-');
+		if (dash) {
+			*dash = '\0';
+			if (kstrtouint(dash + 1, 10, &len))
+				len = 4;
+		}
+		if (len == 0 || len > sizeof(rbuf))
+			len = 4;
+
+		if (kstrtou16(tmp, 16, &op)) {
+			dev_err(cvs->dev, "%s: read-NNNN: parse error '%s'\n",
+				__func__, tmp);
+			return count;
+		}
+
+		memset(rbuf, 0, sizeof(rbuf));
+		rc = cvs_read_i2c(op, rbuf, len);
+		if (rc > 0) {
+			dev_info(cvs->dev, "CVSREAD op=0x%04x len=%u rc=%d OK\n",
+				 op, len, rc);
+			print_hex_dump(KERN_INFO, "cvs-read: ",
+				       DUMP_PREFIX_OFFSET, 16, 1, rbuf, len, true);
+		} else {
+			dev_info(cvs->dev, "CVSREAD op=0x%04x len=%u FAILED rc=%d\n",
+				 op, len, rc);
+		}
 	}
 	else if (strncmp(buf, "cmd-", 4) == 0) {
 		/*
@@ -897,7 +1079,7 @@ static ssize_t cmd_show(struct device *dev, struct device_attribute *attr,
 						char *buf)
 {
 	return sysfs_emit(buf, "command: %s\n",
-			  "[coredump, state, version, id, reset, acquire, mipi, mipi-ir, replay-rgb-init, cmd-820, cmd-822, set-vision, factory-reset, cmd-NNNN]");
+			  "[coredump, state, version, id, reset, acquire, mipi, mipi-ir, replay-rgb-init, cmd-820, cmd-822, set-vision, factory-reset (DEPRECATED), cmd-NNNN]");
 }
 static DEVICE_ATTR_RW(cmd);
 #endif //DEBUG_CVS

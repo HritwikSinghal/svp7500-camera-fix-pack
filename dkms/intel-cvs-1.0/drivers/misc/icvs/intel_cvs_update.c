@@ -9,6 +9,40 @@
 
 extern struct intel_cvs *cvs;
 
+
+/*
+ * IR 0x830 geometry overrides (2026-07-24). The Windows-verbatim IR payload
+ * describes fps=30 lanes=2 3856x2176 -- the RGB sensor's geometry, NOT the
+ * HM1092's 648x368 1-lane. Telling the bridge to expect the wrong frame
+ * geometry on port 2 is a candidate cause of the port-2 silence. These let us
+ * correct each field live and confirm the latch via a 0x082F readback.
+ * 0 = keep the verbatim byte.
+ */
+static ushort ir_fps;
+module_param(ir_fps, ushort, 0644);
+MODULE_PARM_DESC(ir_fps, "Override fps in the IR 0x830 (0=verbatim, e.g. 30)");
+static ushort ir_lanes;
+module_param(ir_lanes, ushort, 0644);
+MODULE_PARM_DESC(ir_lanes, "Override lane count in the IR 0x830 (0=verbatim, e.g. 1)");
+static ushort ir_width;
+module_param(ir_width, ushort, 0644);
+MODULE_PARM_DESC(ir_width, "Override width in the IR 0x830 (0=verbatim, e.g. 648)");
+static ushort ir_height;
+module_param(ir_height, ushort, 0644);
+MODULE_PARM_DESC(ir_height, "Override height in the IR 0x830 (0=verbatim, e.g. 368)");
+static ushort ir_vc_count;
+module_param(ir_vc_count, ushort, 0644);
+MODULE_PARM_DESC(ir_vc_count, "Override vc_count in the IR 0x830 (0=verbatim)");
+static char *ir_poke;
+module_param(ir_poke, charp, 0644);
+MODULE_PARM_DESC(ir_poke,
+	"Poke arbitrary bytes into the IR 0x830 body: \"off:val,off:val\" (0x ok). "
+	"Struct begins at +8: fps+8 lanes+9 phy+10 vc_count+11 vc+12 dt_count+13 "
+	"width+14/15 height+16/17 dt+18. Empty = no pokes.");
+static ushort ir_dt;
+module_param(ir_dt, ushort, 0644);
+MODULE_PARM_DESC(ir_dt, "Override MIPI data type in the IR 0x830 (0=verbatim, e.g. 0x2b)");
+
 int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 {
 	struct intel_cvs *ctx = cvs;
@@ -53,7 +87,18 @@ int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 		out_buff[1] = cmd & 0x00ff;
 		host_identifiers.field.vision_sensing = 0;
 		host_identifiers.field.device_power_setting = 0;
-		host_identifiers.field.privacy_led_host = 0;
+		/*
+		 * 2026-05-13: privacy_led_host was 0 here.  Miguel Vadillo's
+		 * upstream cvs_configure_dev_caps() sends THIS bit set (=1)
+		 * for Synaptics SVP7xxx (06CB:0701) per the quirks table
+		 * (ICVS_HOST_PRIV_CTRL -> ICVS_HOST_ID_PRIVACY_LED, BIT 30).
+		 * Hypothesis: missing this single bit is why our bridge
+		 * stays in "Vision-stack-only" mode for HM1092 and port 2
+		 * stays silent.  Without this the bridge thinks it owns
+		 * the privacy LED logic, which on this hardware appears
+		 * coupled to the IR sensor power/auth path.
+		 */
+		host_identifiers.field.privacy_led_host = 1;
 		host_identifiers.field.rgbcamera_pwrup_host = 1;
 
 		memcpy(&out_buff[2], &host_identifiers.value,
@@ -64,7 +109,9 @@ int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 
 		if (count != cv_host_identifier_size + sizeof(cmd))
 			return -EIO;
-		dev_dbg(cvs->dev, "%s:set_host_identifier cmd pass", __func__);
+		dev_info(cvs->dev,
+			 "%s:set_host_identifier sent host_id=0x%08x (privacy_led_host=1 for svp7xxx)\n",
+			 __func__, host_identifiers.value);
 		break;
 	case HOST_SET_MIPI_CONFIG: {
 		/*
@@ -173,6 +220,71 @@ int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 		if (data == NULL && len == 1) {
 			payload = windows_0x830_ir_body;
 			payload_label = "Windows verbatim IR (port 2)";
+			/*
+			 * Geometry override. The verbatim IR body encodes
+			 * fps=30 lanes=2 3856x2176 -- the RGB sensor's
+			 * geometry, not the HM1092's 648x368 1-lane. Copy to
+			 * a scratch buffer (never mutate the const array) and
+			 * patch only the requested fields. Confirm the result
+			 * with a 0x082F readback.
+			 */
+			if (ir_fps || ir_lanes || ir_width || ir_height ||
+			    ir_vc_count || ir_dt || (ir_poke && ir_poke[0])) {
+				static u8 ir_patched[254];
+
+				memcpy(ir_patched, windows_0x830_ir_body, 254);
+				if (ir_fps)
+					ir_patched[8] = ir_fps & 0xff;
+				if (ir_lanes)
+					ir_patched[9] = ir_lanes & 0xff;
+				if (ir_vc_count)
+					ir_patched[11] = ir_vc_count & 0xff;
+				if (ir_width) {
+					ir_patched[14] = ir_width & 0xff;
+					ir_patched[15] = (ir_width >> 8) & 0xff;
+				}
+				if (ir_height) {
+					ir_patched[16] = ir_height & 0xff;
+					ir_patched[17] = (ir_height >> 8) & 0xff;
+				}
+				if (ir_dt)
+					ir_patched[18] = ir_dt & 0xff;
+				/* Arbitrary byte pokes: "off:val,off:val" (decimal or 0x). */
+				if (ir_poke && ir_poke[0]) {
+					const char *p = ir_poke;
+
+					while (*p) {
+						unsigned int off = 0, val = 0;
+						char *end;
+
+						off = simple_strtoul(p, &end, 0);
+						if (end == p || *end != ':')
+							break;
+						p = end + 1;
+						val = simple_strtoul(p, &end, 0);
+						if (end == p)
+							break;
+						p = end;
+						if (off < 254) {
+							ir_patched[off] = val & 0xff;
+							dev_info(cvs->dev,
+								 "%s: IRPOKE [%u]=0x%02x\n",
+								 __func__, off, val & 0xff);
+						}
+						while (*p == ',' || *p == ' ')
+							p++;
+					}
+				}
+				payload = ir_patched;
+				payload_label = "IR geometry-override";
+				dev_info(cvs->dev,
+					 "%s: IRGEOM fps=%u lanes=%u vc=%u %ux%u dt=0x%02x\n",
+					 __func__, ir_patched[9], ir_patched[10],
+					 ir_patched[12],
+					 ir_patched[15] | (ir_patched[16] << 8),
+					 ir_patched[18] | (ir_patched[19] << 8),
+					 ir_patched[20]);
+			}
 		} else if (data == NULL || len == 0) {
 			payload = windows_0x830_rgb_body;
 			payload_label = "Windows verbatim RGB (port 0)";
@@ -189,52 +301,27 @@ int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 		}
 
 		/*
-		 * 2026-05-12 — split into Windows-equivalent 52-byte chunks.
-		 *
-		 * USBPcap analysis of Windows shows 0x830 is sent as 5 separate
-		 * I2C transactions of 52/52/52/52/48 bytes (matching the Lattice
-		 * USBIO_QUIRK_I2C_MAX_RW_LEN_52 chunking pattern). Linux currently
-		 * sends 256 bytes as ONE I2C transaction (it chunks at the USB
-		 * layer but NOT at the I2C protocol layer — bridge sees a single
-		 * 256-byte write).
-		 *
-		 * The bridge's HOST_SET_MIPI_CONFIG handler may be designed for
-		 * the chunked-transaction pattern. We replicate Windows's wire
-		 * behavior by issuing 5 separate i2c_master_send() calls. Each
-		 * is a complete I2C START + 52 (or 48) bytes + STOP cycle.
-		 *
-		 * The first chunk carries the opcode (0x08 0x30) + payload
-		 * length DWORD + checksum DWORD + the first 42 bytes of the
-		 * 176-byte payload. Chunks 2-4 carry 52 bytes of payload each.
-		 * Chunk 5 carries the final payload bytes + trailing zero-pad.
+		 * USBPcap shows five USBIO bulk packets for this command, but they
+		 * form one logical I2C write: a single INIT precedes the packets,
+		 * only the last packet has the FINAL flag, and a single UNINIT
+		 * follows.  usbio_i2c_write() performs that transport fragmentation
+		 * for a large I2C message.  Splitting this here would instead create
+		 * five independent I2C writes and make bytes 52, 104, ... look like
+		 * new commands to the bridge.
 		 */
-		{
-			const u32 CHUNK = 52;
-			u32 sent = 0;
-			int chunk_count = 0;
-
-			while (sent < total_size) {
-				u32 chunklen = min(CHUNK, total_size - sent);
-				count = i2c_master_send(client,
-							(const char *)mipi_buf + sent,
-							chunklen);
-				chunk_count++;
-				if (count != (int)chunklen) {
-					dev_warn(cvs->dev,
-						 "%s: chunk %d/%d (offset %u, %u bytes) send returned %d\n",
-						 __func__, chunk_count, 5,
-						 sent, chunklen, count);
-					devm_kfree(ctx->dev, mipi_buf);
-					return -EIO;
-				}
-				sent += chunklen;
-			}
-
-			dev_info(cvs->dev,
-				 "%s: HOST_SET_MIPI_CONFIG sent %u/%d bytes as %d chunks of <= %u (%s payload)",
-				 __func__, sent, total_size, chunk_count,
-				 CHUNK, payload_label);
+		count = i2c_master_send(client, (const char *)mipi_buf,
+					total_size);
+		if (count != (int)total_size) {
+			dev_warn(cvs->dev,
+				 "%s: HOST_SET_MIPI_CONFIG send returned %d/%u\n",
+				 __func__, count, total_size);
+			devm_kfree(ctx->dev, mipi_buf);
+			return count < 0 ? count : -EIO;
 		}
+
+		dev_info(cvs->dev,
+			 "%s: HOST_SET_MIPI_CONFIG sent as one %u-byte I2C message (%s payload)",
+			 __func__, total_size, payload_label);
 
 		devm_kfree(ctx->dev, mipi_buf);
 		break;
@@ -525,6 +612,7 @@ int cvs_dev_fw_dl_data(void)
 				break;
 			}
 i2c_packet_loop_end:
+			;
 		} while (--retry && (fw_state & DEVICE_DWNLD_ERROR_MASK));
 
 		if ((fw_state & DEVICE_DWNLD_BUSY_MASK) ||

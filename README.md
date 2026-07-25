@@ -29,7 +29,7 @@ Likely also helps (untested by us, please report):
 | Status | Camera |
 |--------|--------|
 | ✅ Works | RGB front-facing camera (OV08x40) — for video calls, photos, etc. |
-| ⏳ In progress | IR camera (HM1092) — for Windows Hello-style face auth |
+| ✅ **Working** | **IR camera (HM1092)** — Windows Hello-style face auth via Howdy |
 
 ## Quick install
 
@@ -118,7 +118,71 @@ The Synaptics SVP7500 is a proprietary MIPI bridge chip. Synaptics has not publi
 
 This fix pack is the result of three months of community reverse-engineering: USBPcap captures from Windows installs, Ghidra analysis of `Vision.sys`, kernel-side patches, and a lot of iteration.
 
-The remaining mystery — IR camera streaming — appears to require additional bridge commands not visible in standard USBPcap captures. Investigation continues at https://github.com/intel/vision-drivers/issues/37
+### IR camera — SOLVED (2026-07-25)
+
+The IR camera streams, and Howdy authenticates against it from the lock screen.
+
+**Root cause: `V4L2_CID_LINK_FREQ` was set to the MIPI per-lane bit rate instead
+of the DDR clock — exactly 2x too high.** `ipu7-isys` therefore programmed the
+CSI-2 D-PHY at ~721 Mbps against a sensor transmitting at ~361. The clock lane
+came up, but no data packet ever framed, so the port produced zero SOF forever.
+
+```
+648x368 @30, 1 lane, RAW10:
+  LLP 1620 x FLL 740 x 30 fps          = 35,964,000 px/s   (pixel_rate)
+  x 10 bpp                             = 359,640,000 bit/s (bit rate)
+  V4L2_CID_LINK_FREQ = DDR clock       = 180,480,000        <-- correct
+  what the driver published            = 360,960,000        <-- 2x too high
+```
+
+The wrong value came from the natural derivation — the sensor's own PLL
+registers (`19.2 MHz x 94 / 5 = 360.96 MHz`). That is genuinely the PLL output;
+it is just the bit clock, not what V4L2 wants. Anyone reverse-engineering this
+sensor from its PLL configuration lands on the same number. It was finally
+pinned down by extracting the mode-descriptor array from the Windows
+`hm1092.sys`, where `pixel_rate = 36,000,000` sits beside `link = 360,960,000`,
+making the factor of two unambiguous.
+
+**Previous hypotheses in this README and in
+[intel/vision-drivers#37](https://github.com/intel/vision-drivers/issues/37)
+were wrong and are retracted:**
+
+* The CVS bridge does **not** block the data lane. With the bridge given no MIPI
+  link configuration at all, the sensor's clock still reaches the IPU.
+* `HOST_SET_MIPI_CONFIG` (0x0830) is **not** needed for IR. Windows never sends
+  one — every 0x0830 in all seven USB captures carries RGB geometry, and
+  648x368 appears in no USB payload. This fix pack was sending one; Windows does
+  not.
+* The register init table was never wrong — it is byte-identical to Windows in
+  content and order, confirmed both from the USB captures and by extracting the
+  tables from `hm1092.sys` (all four Dell driver builds carry identical tables).
+* There is no frame-trigger, sync or slave-mode register anywhere in the sensor
+  or in any Windows driver build.
+
+Full write-up: [IR-FINDINGS.md](IR-FINDINGS.md)
+
+### Howdy integration
+
+`howdy/ir_reader.py` is a Howdy recorder that reads the IR node directly.
+It deliberately bypasses libcamera/PipeWire, because libcamera's SoftwareIsp
+**debayers** this monochrome sensor (it is tagged SGRBG10) and PipeWire
+renegotiates the stream to 1920x1080, landing the 648x368 payload in a
+mostly-black buffer. It also drives the IR illuminator, which the sensor driver
+cannot because INT3472 owns that GPIO.
+
+Gotchas that cost real debugging time:
+
+* The V4L2 control is **`link_frequency`, not `link_freq`** — the wrong name
+  fails *silently* and yields convincing fake negatives. Always confirm the
+  kernel's `config phy N ... mbps M` line actually changed.
+* `/dev/videoN`, `/dev/v4l-subdevN` and libcamera indexes **shuffle between
+  boots**. Resolve by entity name (`tools/find-ir-node.sh`), never hardcode.
+* Howdy's `dark_threshold` is **not brightness** — it is the percentage of
+  near-black pixels, and a frame is rejected when it *exceeds* the threshold.
+  IR frames here are ~70-77% black, so the stock `60` rejects everything. Use 90.
+* Howdy's recognition runs as the **unprivileged user** under a lock screen, so
+  the illuminator needs `udev/99-hm1092-ir-led.rules` or it silently never fires
+  and every frame is too dark to detect a face.
 
 ## Uninstall
 

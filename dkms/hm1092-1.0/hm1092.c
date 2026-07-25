@@ -48,6 +48,28 @@ module_param(mipi_ir_delay_ms, uint, 0644);
 MODULE_PARM_DESC(mipi_ir_delay_ms,
 		 "ms to sleep between sensor MODE_SELECT=0x01 and bridge mipi-ir config (Windows trace has ~182ms here)");
 
+static bool send_bridge_config = true;
+module_param(send_bridge_config, bool, 0644);
+MODULE_PARM_DESC(send_bridge_config,
+		 "Send intel_cvs HOST_SET_MIPI_CONFIG during stream-on (disable for externally injected transaction tests)");
+
+static bool external_stream_control;
+module_param(external_stream_control, bool, 0644);
+MODULE_PARM_DESC(external_stream_control,
+		 "Arm the IPU pipeline without programming HM1092; used while replaying the captured Windows dual-sensor sequence externally");
+
+/*
+ * Windows arms the sensor PART-WAY THROUGH the init table (at entry 198 of 238)
+ * and streams the trailing 40 writes (its AE groups) while already streaming.
+ * We historically wrote all 238 then armed. Terminal register state is identical
+ * (verified by i2c readback); only the sequence differs. Set to 198 to replay
+ * Windows' order exactly; 0 keeps the legacy behaviour.
+ */
+static unsigned int arm_at_entry;
+module_param(arm_at_entry, uint, 0644);
+MODULE_PARM_DESC(arm_at_entry,
+		 "Arm (MODE_SELECT=0x01) after writing this many init entries, then write the rest while streaming (0=write all then arm; 198=Windows-faithful)");
+
 static bool dump_regs_on_stream = false;
 module_param(dump_regs_on_stream, bool, 0644);
 MODULE_PARM_DESC(dump_regs_on_stream,
@@ -58,6 +80,31 @@ module_param(ae_kick_period_ms, uint, 0644);
 MODULE_PARM_DESC(ae_kick_period_ms,
 		 "If non-zero, hm1092 kicks 0x0104=0x01 to the sensor every N ms while streaming (Windows trace does this every ~132ms - hypothesis is bridge needs periodic refresh to keep MIPI tunnel hot)");
 
+/*
+ * HYPOTHESIS #11 (2026-06-11): per-session dvdd GPIO WRITE is the bridge's
+ * port-2 arming trigger.
+ *
+ * dvdd is not a SoC GPIO — it's bridge VGPO pin1 (gpiochip5/INTC10E2), a
+ * *virtual* GPIO terminated inside the Synaptics SVP7500 firmware. The
+ * tverhaeghe USBPcaps show Windows writes pin1=1 as the FIRST op of EVERY
+ * Hello session (t+0, sensor I2C init follows 1.6ms later) and pin1=0 at
+ * teardown — i.e. the bridge firmware observes a dvdd write *event* at the
+ * start of each IR session. Linux asserts dvdd once at probe (boot) and
+ * holds it forever, so at stream time the bridge never sees the event.
+ * If bridge fw uses that write to arm its port-2 MIPI forwarding state
+ * machine (cf. usbbridge.sys "1_BRIDGE_STATE_TRIGGER_CTX"), holding the
+ * *level* satisfies the sensor's power rail but never trips the trigger.
+ *
+ * If non-zero: at s_stream(1), BEFORE sensor init, cycle the dvdd regulator
+ * off for N ms then back on (generating the same USBIO GPIO-write wire
+ * commands Windows sends: pin1=0, pin1=1), wait 3ms (Windows: 1.6ms from
+ * dvdd=1 to first sensor I2C), then proceed with the normal init flow.
+ */
+static unsigned int dvdd_cycle_ms;
+module_param(dvdd_cycle_ms, uint, 0644);
+MODULE_PARM_DESC(dvdd_cycle_ms,
+		 "If non-zero, cycle dvdd (bridge VGPO pin1) off for N ms at stream start to replay Windows' per-session GPIO write event (0=disabled)");
+
 /* Chip identification */
 #define HM1092_CHIP_ID			0x1091	/* Silicon reports 0x1091, not 0x1092 */
 #define HM1092_REG_CHIP_ID		0x0000	/* 16-bit, big-endian */
@@ -67,7 +114,7 @@ MODULE_PARM_DESC(ae_kick_period_ms,
 #define HM1092_MODE_STANDBY		0x00
 #define HM1092_MODE_STREAMING		0x01
 
-/* Command update — write 0x00 to apply grouped register changes */
+/* Command update — Windows commits each runtime AE group with 0x01 */
 #define HM1092_REG_COMMAND_UPDATE	0x0104
 
 /* Exposure */
@@ -85,7 +132,7 @@ MODULE_PARM_DESC(ae_kick_period_ms,
 #define HM1092_AGAIN_STEP		1
 
 /* Digital gain */
-#define HM1092_REG_DIGITAL_GAIN		0x0207	/* 16-bit, 8.8 fixed point */
+#define HM1092_REG_DIGITAL_GAIN		0x020e	/* 16-bit; Windows writes 0x020e/0x020f */
 #define HM1092_DGAIN_MIN		0x0100
 #define HM1092_DGAIN_MAX		0x0fff
 #define HM1092_DGAIN_DEFAULT		0x0100
@@ -100,13 +147,38 @@ MODULE_PARM_DESC(ae_kick_period_ms,
 #define HM1092_REG_VTS			0x0340	/* 16-bit, vertical total size */
 #define HM1092_REG_HTS			0x0342	/* 16-bit, horizontal total size */
 
-/* Fixed output format */
-#define HM1092_WIDTH			1280
-#define HM1092_HEIGHT			720
+/*
+ * Fixed output format — 648×368 GR1P (10-bit packed mono w/ overscan crop).
+ *
+ * Why 648×368 and not 1280×720?  Cracked open Dell's v81 Vision driver
+ * (Intel 2D Imaging/USB IO/Vision Driver YMY0G_WIN64_81.26100.0.13_A01)
+ * and parsed every graph_settings_hm1092_*_PTL.bin file it ships:
+ *
+ *   22 production module variants (BBG/CBG/CJF — Bison, Chicony, Cammsys):
+ *     ALL of them stream HM1092 at GR1P 648×368, 30 fps.
+ *     ZERO of them advertise 1280×720 as a streaming config.
+ *
+ * Only the dev/reference board (1BD8221) lists higher resolutions, which
+ * we believe map to the Windows-Hello full-frame path — not the always-on
+ * CV stream our hardware actually uses.  Production firmware ONLY validates
+ * the 648×368 GR1P pipeline through the bridge's port-2 secure handshake.
+ *
+ * Our 240-register init sequence below is byte-identical to Windows USBPcap
+ * (intel/vision-drivers#37, 2026-05-12).  Since Windows streams 648×368,
+ * those registers ALREADY program the sensor for 648×368 output — we were
+ * just lying to V4L2/IPU7 about what geometry comes out, so the receiver
+ * was throwing away mismatched-size frames at the CSI-2 boundary.
+ *
+ * 648 = 640 + 8 horizontal overscan past 2x2-binned 1280.
+ * 368 = 360 + 8 vertical overscan past 2x2-binned 720.
+ */
+#define HM1092_WIDTH			648
+#define HM1092_HEIGHT			368
 /*
  * The sensor outputs 10-bit mono, but IPU7 ISYS only accepts Bayer formats.
  * Report as SGRBG10 — the mono IR data will be captured identically
  * (single-channel data interpreted as one Bayer color, which is fine).
+ * "GR1P" in Dell's graph_settings file = SGRBG10 packed (Intel naming).
  */
 #define HM1092_MBUS_CODE		MEDIA_BUS_FMT_SGRBG10_1X10
 
@@ -114,6 +186,26 @@ MODULE_PARM_DESC(ae_kick_period_ms,
 #define HM1092_LANES			1
 /* 19.2 MHz MCLK * 94 (PLL mult 0x5E) / 5 (PLL div 0x0A) = 360.96 MHz */
 #define HM1092_LINK_FREQ_384MHZ		360960000ULL
+/*
+ * Corrected value. hm1092.sys's mode descriptor declares 360,960,000 as the
+ * per-lane BIT RATE (1620*740*30*10bpp for 648x368@30, 1 lane RAW10) and
+ * pixel_rate 36,000,000. V4L2_CID_LINK_FREQ is the DDR clock = bitrate/2.
+ * Publishing the bit rate made isys program the D-PHY at ~721 Mbps, 2x the
+ * sensor's real line rate -- consistent with the clock lane going active while
+ * the data lane never validates a packet.
+ */
+#define HM1092_LINK_FREQ_180MHZ		180480000ULL
+/*
+ * 2026-05-13 NOTE: a brief experiment changed these to LANES=2 +
+ * LINK_FREQ=1497600000 based on Windows USBPcap decode of the bridge's
+ * 0x830 payload (which announces 2 lanes / 1497.6 MHz on the bridge→IPU7
+ * link).  Combined with a parallel ipu-bridge override of sensor->lanes,
+ * this caused graphics artifacts and a hard system freeze on PTL — the
+ * IPU7 firmware doesn't fail-safe on lane/frequency mismatches and the
+ * resulting bad DMA appears to corrupt IOMMU pages shared with the Xe
+ * GPU.  Reverted to the original safe values; lane/freq change requires
+ * Intel-side coordination (filed via vision-drivers thread).
+ */
 
 /*
  * Minimal init sequence — just enough to configure the sensor for streaming.
@@ -136,12 +228,14 @@ static const struct hm1092_reg hm1092_init_regs[] = {
 	 * windows_hello_unlock USBPcap capture (intel/vision-drivers#37,
 	 * 2026-05-12). 240 register writes in EXACT Windows order.
 	 *
-	 * Includes all writes from initial standby through streaming
-	 * through post-activation tweaks. Entry 240 puts sensor back
-	 * to standby (0x0100=0x00) — hm1092_set_stream(1) explicitly
-	 * writes 0x0100=0x01 AFTER this table, overriding the final
-	 * standby, leaving sensor streaming. Net behavior matches
-	 * Windows runtime state.
+	 * NOTE (2026-07-09): the capture is a WHOLE Hello session — init,
+	 * a single stream-on, the runtime AE loop, AND the session teardown
+	 * (final 0x0100=0x00). Replaying it verbatim, then re-streaming in
+	 * hm1092_set_stream(1), made the sensor arm/disarm/re-arm — a
+	 * double-arm no real Hello session performs. The mid-table stream-on
+	 * and the teardown standby have been removed (see inline comments);
+	 * the sensor is armed exactly ONCE, terminally, in set_stream(1),
+	 * matching the Windows single-arm structure.
 	 */
 	{ 0x0100, 0x00 },
 	{ 0x0103, 0x00 },
@@ -341,7 +435,19 @@ static const struct hm1092_reg hm1092_init_regs[] = {
 	{ 0x020e, 0x01 },
 	{ 0x020f, 0x00 },
 	{ 0x0104, 0x01 },
-	{ 0x0100, 0x01 },
+	/*
+	 * REMOVED 2026-07-09 (single-arm fix): this mid-table stream-on
+	 * (0x0100=0x01), combined with the teardown standby (0x0100=0x00) at
+	 * the end of this table, made the sensor double-arm: ON -> [AE frames]
+	 * -> OFF -> (ctrl stomps) -> ON (in hm1092_set_stream). The captured
+	 * Windows Hello session streams on exactly ONCE and the trailing 0x00
+	 * was Windows' *session teardown*, not part of stream setup. The
+	 * SVP7500 bridge appears to latch port-2 MIPI forwarding on the FIRST
+	 * clock edge; our teardown de-armed it and the re-enable was an edge it
+	 * no longer watched. Sensor now streams once, terminally, in
+	 * hm1092_set_stream(1). The following AE-loop writes are left in place
+	 * (harmless while in standby; set converged exposure before stream-on).
+	 */
 	{ 0x0340, 0x02 },
 	{ 0x0341, 0xe5 },
 	{ 0x0202, 0x00 },
@@ -382,7 +488,10 @@ static const struct hm1092_reg hm1092_init_regs[] = {
 	{ 0x020e, 0x01 },
 	{ 0x020f, 0x00 },
 	{ 0x0104, 0x01 },
-	{ 0x0100, 0x00 },
+	/* REMOVED 2026-07-09 (single-arm fix): Windows session-teardown
+	 * standby — see the block comment above. Table now leaves the sensor
+	 * in standby (from the 0x0100=0x00 at the top), ready for a single
+	 * terminal stream-on in hm1092_set_stream(1). */
 };
 
 struct hm1092 {
@@ -403,9 +512,14 @@ struct hm1092 {
 	struct regulator *dvdd;
 	struct regulator *avdd;
 	struct regulator *dovdd;
+	bool dvdd_enabled;
+	bool avdd_enabled;
+	bool dovdd_enabled;
 
 	/* Reference clock from INT3472 GPIO clock */
 	struct clk *extclk;
+	bool extclk_enabled;
+	bool stream_clock_enabled;
 
 	/* IR flood LED — mapped by INT3472 type 0x02 as "ir-led" GPIO */
 	struct gpio_desc *ir_led;
@@ -530,19 +644,33 @@ static int hm1092_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CID_TEST_PATTERN:
 		ret = hm1092_write_reg(client, HM1092_REG_TEST_PATTERN,
-				       ctrl->val);
+				       ctrl->val ? (ctrl->val << 1) |
+				       HM1092_TEST_PATTERN_ON :
+				       HM1092_TEST_PATTERN_OFF);
 		break;
 	default:
-		break;
+		return 0;
 	}
-	return ret;
+
+	if (ret)
+		return ret;
+
+	/* Match the captured HM1092 runtime control groups: data, then 0x0104=1. */
+	return hm1092_write_reg(client, HM1092_REG_COMMAND_UPDATE, 0x01);
 }
 
 static const struct v4l2_ctrl_ops hm1092_ctrl_ops = {
 	.s_ctrl = hm1092_set_ctrl,
 };
 
+/*
+ * index 0 = corrected DDR clock (180.48 MHz -> ~361 Mbps, matches Windows)
+ * index 1 = legacy value (360.96 MHz -> ~722 Mbps)  <-- DEFAULT, unchanged
+ * Selectable at runtime; isys reads this control at stream-on to program the
+ * D-PHY. Default is the legacy value because a bad rate can hard-freeze PTL.
+ */
 static const s64 hm1092_link_freqs[] = {
+	HM1092_LINK_FREQ_180MHZ,
 	HM1092_LINK_FREQ_384MHZ,
 };
 
@@ -576,19 +704,22 @@ static int hm1092_init_controls(struct hm1092 *hm)
 	hm->vblank = v4l2_ctrl_new_std(handler, &hm1092_ctrl_ops,
 				       V4L2_CID_VBLANK, 80, 2000, 1, 80);
 
+	/*
+	 * NOT read-only: index 0 selects the corrected 180.48 MHz DDR clock so the
+	 * 2x-rate hypothesis can be A/B tested without a rebuild. Default index 1
+	 * keeps the historical value.
+	 */
 	hm->link_freq = v4l2_ctrl_new_int_menu(handler, &hm1092_ctrl_ops,
 						V4L2_CID_LINK_FREQ,
 						ARRAY_SIZE(hm1092_link_freqs) - 1,
 						0, hm1092_link_freqs);
-	if (hm->link_freq)
-		hm->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	/* pixel_rate = link_freq * 2 (DDR) * lanes / bpp */
 	hm->pixel_rate = v4l2_ctrl_new_std(handler, &hm1092_ctrl_ops,
 					    V4L2_CID_PIXEL_RATE, 0,
-					    HM1092_LINK_FREQ_384MHZ * 2 * HM1092_LANES / 10,
+					    HM1092_LINK_FREQ_180MHZ * 2 * HM1092_LANES / 10,
 					    1,
-					    HM1092_LINK_FREQ_384MHZ * 2 * HM1092_LANES / 10);
+					    HM1092_LINK_FREQ_180MHZ * 2 * HM1092_LANES / 10);
 	if (hm->pixel_rate)
 		hm->pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
@@ -661,7 +792,7 @@ static int hm1092_set_format(struct v4l2_subdev *sd,
 {
 	struct v4l2_mbus_framefmt *mf = &fmt->format;
 
-	/* Fixed format — only 1280x720 Y10 */
+	/* Fixed format — only 648x368 GR1P (matches Dell production graph_settings) */
 	mf->width = HM1092_WIDTH;
 	mf->height = HM1092_HEIGHT;
 	mf->code = HM1092_MBUS_CODE;
@@ -738,16 +869,92 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 		if (ret && ret != -EACCES)
 			return ret;
 
-		/* Write init sequence */
-		dev_info(&client->dev, "  writing %zu-entry init sequence...\n",
-			 ARRAY_SIZE(hm1092_init_regs));
-		ret = hm1092_write_reg_list(client, hm1092_init_regs,
-					     ARRAY_SIZE(hm1092_init_regs));
-		if (ret) {
-			dev_err(&client->dev, "init sequence failed: %d\n", ret);
-			goto err_rpm;
+		/*
+		 * Diagnostic mode for a capture-faithful dual-sensor replay.  The
+		 * IPU receiver must be listening before userspace replays Windows'
+		 * interleaved HM1092/OV08x40 writes and intact 0x0830 transaction.
+		 * Probe already holds the sensor rails and MCLK, so leave sensor I2C
+		 * completely untouched here and only arm the media pipeline.
+		 */
+		if (external_stream_control) {
+			if (hm->ir_led)
+				gpiod_set_value_cansleep(hm->ir_led, 1);
+			hm->streaming = true;
+			dev_info(&client->dev,
+				 "  external_stream_control=1: IPU armed; sensor programming deferred to capture replay\n");
+			return 0;
 		}
-		dev_info(&client->dev, "  init sequence written OK\n");
+
+		/*
+		 * HYP#11: replay Windows' per-session dvdd GPIO write event.
+		 * The dvdd "regulator" is bridge VGPO pin1 — the disable/
+		 * enable pair below emits the exact USBIO GPIO-write commands
+		 * (pin1=0, pin1=1) Windows sends around every Hello session.
+		 * The bridge firmware terminates these writes and may use
+		 * them to arm port-2 MIPI forwarding. NOTHING may touch the
+		 * sensor's I2C address (0x24) while dvdd is low.
+		 */
+		if (dvdd_cycle_ms && hm->dvdd) {
+			dev_info(&client->dev,
+				 "  HYP#11: cycling dvdd (bridge VGPO pin1) off for %u ms...\n",
+				 dvdd_cycle_ms);
+			regulator_disable(hm->dvdd);
+			/*
+			 * rmmod leaks a use_count on INT3472:00-dvdd (devm
+			 * frees the consumer while enabled), so after any
+			 * module reload a single disable never reaches 0 and
+			 * the VGPO pin never physically moves (verified via
+			 * usbmon: zero USB traffic). Force it off so the
+			 * bridge actually sees the write event.
+			 */
+			if (regulator_is_enabled(hm->dvdd) > 0) {
+				dev_warn(&client->dev,
+					 "  HYP#11: dvdd still on after disable (leaked use_count) — forcing off\n");
+				regulator_force_disable(hm->dvdd);
+			}
+			msleep(dvdd_cycle_ms);
+			ret = regulator_enable(hm->dvdd);
+			if (ret) {
+				dev_err(&client->dev,
+					"  HYP#11: dvdd re-enable FAILED: %d — aborting stream\n",
+					ret);
+				goto err_rpm;
+			}
+			/* Windows: dvdd=1 → first sensor I2C = 1.6ms */
+			usleep_range(3000, 4000);
+			if (regulator_is_enabled(hm->dvdd) <= 0)
+				dev_err(&client->dev,
+					"  HYP#11: dvdd NOT physically on after re-enable — refcount poisoned (reboot needed), TEST INVALID\n");
+			else
+				dev_info(&client->dev,
+					 "  HYP#11: dvdd back on, proceeding with sensor init\n");
+		}
+
+		/*
+		 * Write init sequence. If arm_at_entry is set we only write the
+		 * head here; the tail is written AFTER MODE_SELECT=0x01 below,
+		 * replaying Windows' order.
+		 */
+		{
+			size_t total = ARRAY_SIZE(hm1092_init_regs);
+			size_t head = (arm_at_entry && arm_at_entry < total)
+				      ? arm_at_entry : total;
+
+			if (head != total)
+				dev_info(&client->dev,
+					 "  ARMORDER: writing head %zu/%zu, tail %zu deferred until after arm\n",
+					 head, total, total - head);
+			else
+				dev_info(&client->dev,
+					 "  writing %zu-entry init sequence...\n", total);
+
+			ret = hm1092_write_reg_list(client, hm1092_init_regs, head);
+			if (ret) {
+				dev_err(&client->dev, "init sequence failed: %d\n", ret);
+				goto err_rpm;
+			}
+			dev_info(&client->dev, "  init sequence written OK\n");
+		}
 
 		/* Apply controls */
 		ret = __v4l2_ctrl_handler_setup(&hm->ctrl_handler);
@@ -766,6 +973,25 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 			goto err_rpm;
 		}
 		dev_info(&client->dev, "  MODE_SELECT=0x01 ack'd by sensor\n");
+
+		/*
+		 * Windows-faithful tail: the remaining entries (its AE groups)
+		 * are written while the sensor is already streaming.
+		 */
+		if (arm_at_entry && arm_at_entry < ARRAY_SIZE(hm1092_init_regs)) {
+			size_t tail = ARRAY_SIZE(hm1092_init_regs) - arm_at_entry;
+
+			ret = hm1092_write_reg_list(client,
+						    &hm1092_init_regs[arm_at_entry],
+						    tail);
+			if (ret)
+				dev_warn(&client->dev,
+					 "  ARMORDER: post-arm tail failed: %d\n", ret);
+			else
+				dev_info(&client->dev,
+					 "  ARMORDER: wrote %zu post-arm entries while streaming\n",
+					 tail);
+		}
 
 		/*
 		 * TEST 2 instrumentation: dump key sensor regs that may be
@@ -807,6 +1033,8 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 			unsigned long pre_rate = clk_get_rate(hm->extclk);
 			int clk_ret = clk_prepare_enable(hm->extclk);
 			unsigned long post_rate = clk_get_rate(hm->extclk);
+			if (!clk_ret)
+				hm->stream_clock_enabled = true;
 			dev_info(&client->dev,
 				 "  MCLK pre=%lu Hz, defensive clk_prepare_enable returned %d, post=%lu Hz\n",
 				 pre_rate, clk_ret, post_rate);
@@ -820,7 +1048,10 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 		 * it processes the config. Previously we did it backwards and
 		 * port 2 stayed silent.
 		 */
-		if (cvs_send_mipi_ir_config) {
+		if (!send_bridge_config) {
+			dev_info(&client->dev,
+				 "  bridge mipi-ir config skipped by module parameter\n");
+		} else if (cvs_send_mipi_ir_config) {
 			int cvs_ret = cvs_send_mipi_ir_config();
 			dev_info(&client->dev,
 				 "  intel_cvs port-2 mipi config returned %d\n",
@@ -866,8 +1097,10 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 		cancel_delayed_work_sync(&hm->ae_kick_work);
 
 		/* Balance the defensive clk_prepare_enable() from set_stream(1) */
-		if (hm->extclk)
+		if (hm->stream_clock_enabled) {
 			clk_disable_unprepare(hm->extclk);
+			hm->stream_clock_enabled = false;
+		}
 
 		/* Turn off IR LED before sensor goes to standby */
 		if (hm->ir_led) {
@@ -991,6 +1224,30 @@ static int hm1092_check_chip_id(struct i2c_client *client)
 	return 0;
 }
 
+static void hm1092_power_off(struct hm1092 *hm)
+{
+	if (hm->stream_clock_enabled) {
+		clk_disable_unprepare(hm->extclk);
+		hm->stream_clock_enabled = false;
+	}
+	if (hm->extclk_enabled) {
+		clk_disable_unprepare(hm->extclk);
+		hm->extclk_enabled = false;
+	}
+	if (hm->dvdd_enabled) {
+		regulator_disable(hm->dvdd);
+		hm->dvdd_enabled = false;
+	}
+	if (hm->avdd_enabled) {
+		regulator_disable(hm->avdd);
+		hm->avdd_enabled = false;
+	}
+	if (hm->dovdd_enabled) {
+		regulator_disable(hm->dovdd);
+		hm->dovdd_enabled = false;
+	}
+}
+
 static int hm1092_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -1014,52 +1271,65 @@ static int hm1092_probe(struct i2c_client *client)
 	hm->dvdd = devm_regulator_get_optional(dev, "dvdd");
 	if (IS_ERR(hm->dvdd)) {
 		if (PTR_ERR(hm->dvdd) == -EPROBE_DEFER)
-			return -ENODEV; /* Never defer */
+			return -EPROBE_DEFER;
 		hm->dvdd = NULL;
 	}
 
 	hm->avdd = devm_regulator_get_optional(dev, "avdd");
 	if (IS_ERR(hm->avdd)) {
 		if (PTR_ERR(hm->avdd) == -EPROBE_DEFER)
-			return -ENODEV;
+			return -EPROBE_DEFER;
 		hm->avdd = NULL;
 	}
 
 	hm->dovdd = devm_regulator_get_optional(dev, "dovdd");
 	if (IS_ERR(hm->dovdd)) {
 		if (PTR_ERR(hm->dovdd) == -EPROBE_DEFER)
-			return -ENODEV;
+			return -EPROBE_DEFER;
 		hm->dovdd = NULL;
 	}
 
-	/* Enable whatever supplies we found */
+	/* Enable supplies, recording only successful enables for unwind/remove. */
 	if (hm->dovdd) {
 		ret = regulator_enable(hm->dovdd);
-		if (ret)
-			dev_warn(dev, "Failed to enable dovdd: %d\n", ret);
+		if (ret) {
+			dev_err(dev, "Failed to enable dovdd: %d\n", ret);
+			goto err_power;
+		}
+		hm->dovdd_enabled = true;
 	}
 	if (hm->avdd) {
 		ret = regulator_enable(hm->avdd);
-		if (ret)
-			dev_warn(dev, "Failed to enable avdd: %d\n", ret);
+		if (ret) {
+			dev_err(dev, "Failed to enable avdd: %d\n", ret);
+			goto err_power;
+		}
+		hm->avdd_enabled = true;
 	}
 	if (hm->dvdd) {
 		ret = regulator_enable(hm->dvdd);
-		if (ret)
-			dev_warn(dev, "Failed to enable dvdd: %d\n", ret);
+		if (ret) {
+			dev_err(dev, "Failed to enable dvdd: %d\n", ret);
+			goto err_power;
+		}
+		hm->dvdd_enabled = true;
 	}
 
 	/* Get and enable reference clock from INT3472 */
 	hm->extclk = devm_clk_get_optional(dev, NULL);
 	if (IS_ERR(hm->extclk)) {
-		if (PTR_ERR(hm->extclk) == -EPROBE_DEFER)
-			return -ENODEV;
+		ret = PTR_ERR(hm->extclk);
+		if (ret == -EPROBE_DEFER)
+			goto err_power;
 		hm->extclk = NULL;
 	}
 	if (hm->extclk) {
 		ret = clk_prepare_enable(hm->extclk);
-		if (ret)
-			dev_warn(dev, "Failed to enable extclk: %d\n", ret);
+		if (ret) {
+			dev_err(dev, "Failed to enable extclk: %d\n", ret);
+			goto err_power;
+		}
+		hm->extclk_enabled = true;
 	}
 
 	/*
@@ -1071,8 +1341,9 @@ static int hm1092_probe(struct i2c_client *client)
 	 */
 	hm->ir_led = devm_gpiod_get_optional(dev, "ir-led", GPIOD_OUT_LOW);
 	if (IS_ERR(hm->ir_led)) {
-		if (PTR_ERR(hm->ir_led) == -EPROBE_DEFER)
-			return -ENODEV;
+		ret = PTR_ERR(hm->ir_led);
+		if (ret == -EPROBE_DEFER)
+			goto err_power;
 		hm->ir_led = NULL;
 	}
 
@@ -1089,15 +1360,8 @@ static int hm1092_probe(struct i2c_client *client)
 
 	/* Verify chip identity */
 	ret = hm1092_check_chip_id(client);
-	if (ret) {
-		if (hm->dvdd)
-			regulator_disable(hm->dvdd);
-		if (hm->avdd)
-			regulator_disable(hm->avdd);
-		if (hm->dovdd)
-			regulator_disable(hm->dovdd);
-		return ret;
-	}
+	if (ret)
+		goto err_power;
 
 	/* Put back to standby, keep power for later streaming */
 	hm1092_write_reg(client, HM1092_REG_MODE_SELECT, HM1092_MODE_STANDBY);
@@ -1106,7 +1370,7 @@ static int hm1092_probe(struct i2c_client *client)
 	ret = hm1092_init_controls(hm);
 	if (ret) {
 		dev_err(dev, "Failed to init controls: %d\n", ret);
-		return ret;
+		goto err_power;
 	}
 
 	/* Register media entity */
@@ -1144,6 +1408,8 @@ err_media:
 	media_entity_cleanup(&hm->sd.entity);
 err_ctrl:
 	v4l2_ctrl_handler_free(&hm->ctrl_handler);
+	err_power:
+	hm1092_power_off(hm);
 	return ret;
 }
 
@@ -1165,6 +1431,15 @@ static void hm1092_remove(struct i2c_client *client)
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(&hm->ctrl_handler);
 	pm_runtime_disable(&client->dev);
+
+	/*
+	 * Release the rails probe enabled. Without this, every module
+	 * reload leaks one use_count on INT3472:00-dvdd (the devm consumer
+	 * is freed while enabled — that's the rmmod regulator WARN), after
+	 * which regulator_disable() at stream time can never reach 0 and
+	 * the bridge VGPO pin never physically moves (HYP#11 test invalid).
+	 */
+	hm1092_power_off(hm);
 }
 
 static const struct acpi_device_id hm1092_acpi_ids[] = {
