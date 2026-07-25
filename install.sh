@@ -327,9 +327,54 @@ fi
 log ""
 log "Installing udev rule..."
 cp "$SCRIPT_DIR/udev/99-svp7500-no-autosuspend.rules" /etc/udev/rules.d/
+# IR illuminator permissions. Howdy's face-recognition process runs as the
+# UNPRIVILEGED USER when invoked from a lock screen / PAM stack, but INT3472
+# exposes the IR flood LED as a root-only sysfs LED device. Without this rule
+# the illuminator silently never fires there, every frame comes back too dark
+# to detect a face, and authentication times out -- while working perfectly
+# under sudo, which makes it maddening to diagnose.
+if [ -f "$SCRIPT_DIR/udev/99-hm1092-ir-led.rules" ]; then
+    cp "$SCRIPT_DIR/udev/99-hm1092-ir-led.rules" /etc/udev/rules.d/
+    udevadm trigger --subsystem-match=leds --action=change 2>/dev/null || true
+    ok "IR illuminator udev rule installed"
+fi
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=usb --action=change 2>/dev/null || true
 ok "udev rule installed and reloaded"
+
+# --- Howdy IR integration (optional) ---------------------------------------
+if [ -d /usr/lib/howdy/recorders ] && [ -f "$SCRIPT_DIR/howdy/ir_reader.py" ]; then
+    log ""
+    log "Installing Howdy IR integration..."
+    install -m 0444 "$SCRIPT_DIR/howdy/ir_reader.py" /usr/lib/howdy/recorders/ir_reader.py
+    if ! grep -q 'ir_reader' /usr/lib/howdy/recorders/video_capture.py 2>/dev/null; then
+        cp /usr/lib/howdy/recorders/video_capture.py \
+           "$BACKUP_DIR/video_capture.py.orig" 2>/dev/null || true
+        chmod 644 /usr/lib/howdy/recorders/video_capture.py
+        patch -p0 -d / --forward --silent \
+            < "$SCRIPT_DIR/howdy/video_capture.patch" 2>/dev/null \
+            && ok "  video_capture.py patched (ir plugin registered)" \
+            || warn "  video_capture.py patch failed -- apply howdy/video_capture.patch manually"
+        chmod 444 /usr/lib/howdy/recorders/video_capture.py
+    else
+        ok "  video_capture.py already has the ir plugin"
+    fi
+    if [ -f /etc/howdy/config.ini ]; then
+        cp /etc/howdy/config.ini "$BACKUP_DIR/howdy-config.ini.orig" 2>/dev/null || true
+        sed -i 's/^recording_plugin *=.*/recording_plugin = ir/' /etc/howdy/config.ini
+        # dark_threshold is the % of NEAR-BLACK pixels above which a frame is
+        # REJECTED -- it is not brightness. IR frames are ~70-77% black because
+        # the flood lights only the face, so the stock 60 rejects every frame.
+        sed -i 's/^dark_threshold *=.*/dark_threshold = 90/' /etc/howdy/config.ini
+        sed -i 's/^timeout *=.*/timeout = 6/' /etc/howdy/config.ini
+        ok "  config: recording_plugin=ir, dark_threshold=90, timeout=6"
+        warn "  set device_path to your IR node: $SCRIPT_DIR/tools/find-ir-node.sh"
+    fi
+else
+    log ""
+    log "Howdy not installed -- skipping IR face-auth integration"
+    log "  (the IR camera itself still works; install Howdy then re-run this)"
+fi
 
 # Final report
 echo ""
@@ -364,11 +409,15 @@ echo "       - /sys/module/hm1092/parameters/{mipi_ir_delay_ms,"
 echo "         dump_regs_on_stream, ae_kick_period_ms}"
 echo "         tunable at runtime (no rebuild needed)"
 echo ""
-echo "  Known issues:"
-echo "    - IR camera (HM1092, Windows Hello) DOES NOT yet stream."
-echo "      Three hypotheses systematically ruled out 2026-05-12:"
-echo "      OTP mismatch, sensor->bridge timing, AE-loop kicks."
-echo "      Current investigation: iaisptrustlet64.dll RE."
+echo "  IR camera (HM1092): WORKING as of v0.8."
+echo "    Root cause was V4L2_CID_LINK_FREQ set to the MIPI bit rate instead"
+echo "    of the DDR clock -- 2x too high -- so the CSI-2 D-PHY ran at ~721"
+echo "    Mbps against a sensor sending ~361. Clock lane up, no data framed."
+echo "    Fixed: LINK_FREQ = 180,480,000."
+echo ""
+echo "    Verify:  sudo ./tools/verify.sh"
+echo "    IR node: ./tools/find-ir-node.sh   (node numbers shuffle per boot)"
+echo "    Enrol:   sudo howdy -U \$USER add"
 echo ""
 echo "  Found a bug? Report at https://github.com/intel/vision-drivers/issues/37"
 echo "  Repo + releases:  https://github.com/jibsta210/svp7500-camera-fix-pack"
