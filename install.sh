@@ -257,12 +257,35 @@ install_dkms() {
         fi
     fi
 
-    # Add + install
+    # Add + install.
+    #
+    # Build for EVERY kernel that has headers, not just the running one. If you
+    # only build for $(uname -r), booting any other installed kernel comes up
+    # with a stale or missing module and the camera is dead there -- and the
+    # failure looks like a regression rather than a missing build. Set
+    # KVER_ONLY=1 to restrict to the running kernel.
     dkms add "$name/$version" 2>/dev/null || true
-    if dkms install "$name/$version" -k "$KVER"; then
-        ok "  $name-$version installed for $KVER"
+
+    local kernels
+    if [[ "${KVER_ONLY:-0}" == "1" ]]; then
+        kernels="$KVER"
     else
-        warn "  $name-$version build FAILED for $KVER"
+        kernels=$(ls /lib/modules)
+    fi
+
+    local any_ok=0
+    for k in $kernels; do
+        [[ -d "/lib/modules/$k/build" ]] || continue
+        if dkms install "$name/$version" -k "$k" >/dev/null 2>&1; then
+            ok "  $name-$version installed for $k"
+            any_ok=1
+        else
+            warn "  $name-$version build FAILED for $k"
+        fi
+    done
+
+    if [[ $any_ok -eq 0 ]]; then
+        warn "  $name-$version built for NO kernel"
         if [[ "$KEEP_GOING" != "1" ]]; then
             warn "  Set KEEP_GOING=1 to continue past failures"
             return 1
@@ -320,6 +343,38 @@ else
         ok "  patched usbio.ko installed (revert: cp $BACKUP_DIR/usbio.ko.zst.orig $ORIG && depmod -a && reboot)"
     else
         warn "  usbio build failed — skipping (existing module unchanged, RGB still works without this patch)"
+    fi
+fi
+
+# --- IPU7 psys s2idle suspend patches --------------------------------------
+# Without these, psys_suspend() returns -EBUSY whenever the camera pipeline is
+# live, so s2idle aborts and you land back on the lock screen instead of
+# sleeping. Note this is especially easy to trigger with face unlock enabled:
+# the lock screen starts a face scan, which opens the camera, roughly half a
+# second before the kernel's device-suspend phase runs.
+PSYS_PATCH="$SCRIPT_DIR/dkms/ipu7-psys-patches/psys-suspend-BC.patch"
+if [ -f "$PSYS_PATCH" ]; then
+    log ""
+    log "Applying IPU7 psys s2idle suspend patches..."
+    # Select the tree DKMS actually HAS INSTALLED. Choosing with `ls | tail -1`
+    # picks a stale leftover tree and silently patches the wrong source.
+    PSYS_VER=$(dkms status 2>/dev/null | sed -n 's|^ipu7-drivers/\([^,]*\),.*installed.*|\1|p' | head -1)
+    if [ -n "$PSYS_VER" ] && [ -d "/usr/src/ipu7-drivers-$PSYS_VER" ]; then
+        if patch -p1 -d "/usr/src/ipu7-drivers-$PSYS_VER" --forward --silent < "$PSYS_PATCH" 2>/dev/null; then
+            ok "  patches applied to ipu7-drivers-$PSYS_VER"
+        else
+            ok "  patches already present"
+        fi
+        for k in $(ls /lib/modules); do
+            [ -d "/lib/modules/$k/build" ] || continue
+            dkms remove  "ipu7-drivers/$PSYS_VER" -k "$k" >/dev/null 2>&1 || true
+            dkms install "ipu7-drivers/$PSYS_VER" -k "$k" >/dev/null 2>&1 \
+                && ok "  ipu7-drivers rebuilt for $k" \
+                || warn "  ipu7-drivers rebuild failed for $k"
+        done
+    else
+        warn "  ipu7-drivers DKMS not installed -- skipping psys patches"
+        warn "  (install intel-ipu7-dkms-git / the vendor ipu7-drivers first)"
     fi
 fi
 

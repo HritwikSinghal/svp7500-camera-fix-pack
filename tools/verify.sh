@@ -62,3 +62,22 @@ if [ "$EUID" -eq 0 ] && [ -n "${SD:-}" ]; then
 else
   p "live capture" "run as root to test"
 fi
+
+# A stale DKMS registration (e.g. a leftover *.bak-* source directory that was
+# ever `dkms add`ed) makes EVERY future `dkms autoinstall` report failure, which
+# on a kernel upgrade looks like our modules broke and can mask a real failure.
+echo
+echo "--- DKMS health ---"
+STALE=$(dkms status 2>/dev/null | grep -iE '\.bak|\.orig' | head -3)
+if [ -n "$STALE" ]; then
+  echo "  !! stale DKMS registrations found -- remove them:"
+  echo "$STALE" | sed 's/^/     /'
+  echo "     sudo dkms remove <name>/<version> --all   &&   move the dir out of /usr/src"
+else
+  echo "  no stale DKMS registrations"
+fi
+for m in hm1092 intel-cvs ipu-bridge-patched; do
+  a=$(grep -oE 'AUTOINSTALL="?[a-zA-Z]+' /usr/src/$m-1.0/dkms.conf 2>/dev/null | head -1)
+  case "$a" in *yes*) p_ok="yes (auto-builds on new kernels)";; *) p_ok="NO -- will not survive a kernel upgrade";; esac
+  printf "  %-22s AUTOINSTALL=%s\n" "$m" "$p_ok"
+done
