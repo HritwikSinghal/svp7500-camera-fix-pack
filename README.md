@@ -10,6 +10,31 @@ Restore RGB camera functionality on Linux for laptops with the Synaptics SVP7500
 > - Ubuntu / Debian — should work with `linux-headers-$(uname -r)`
 > - Stock Arch / EndeavourOS — should work; we run a custom kernel but the DKMS modules don't depend on those custom patches
 
+## Which problem do you have?
+
+There are **two completely different kinds of laptop IR camera**, and the fixes
+have nothing in common. Check before you spend time here:
+
+```bash
+# Is your IR camera a USB UVC webcam?
+lsusb -v 2>/dev/null | grep -B4 'bInterfaceClass.*14 Video'
+ls /sys/bus/usb/drivers/uvcvideo/
+
+# Or a MIPI sensor behind an Intel IPU?
+v4l2-ctl --list-devices | grep -A2 ipu
+```
+
+| your camera | what you need |
+|---|---|
+| **USB UVC IR webcam** (`uvcvideo` bound, interface class 14) | **not this repo** — use [linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter), which flips the vendor UVC control that switches the emitter on |
+| **MIPI CSI-2 sensor on Intel IPU6/IPU7** (driver `intel-ipu7`/`ipu6`, sensor in the media graph, bridge is USB class 255 vendor-specific) | **this repo** |
+
+On IPU platforms the sensor is not a USB webcam at all — it reaches the host
+over MIPI CSI-2 through the IPU, and the Synaptics bridge exposes only a
+vendor-specific bulk interface carrying an I2C tunnel. There is no UVC device to
+send a control to, so UVC-based tools cannot help, and conversely nothing here
+applies to a UVC webcam.
+
 ## Affected hardware
 
 Confirmed working:
