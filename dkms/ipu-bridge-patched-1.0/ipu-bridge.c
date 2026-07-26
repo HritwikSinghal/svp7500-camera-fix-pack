@@ -50,7 +50,7 @@
  */
 static const struct ipu_sensor_config ipu_supported_sensors[] = {
 	/* Himax HM1092 (IR sensor, Dell XPS Panther Lake) */
-	IPU_SENSOR_CONFIG("HIMX1092", 1, 360960000),
+	IPU_SENSOR_CONFIG("HIMX1092", 1, 180480000),
 	/* Himax HM11B1 */
 	IPU_SENSOR_CONFIG("HIMX11B1", 1, 384000000),
 	/* Himax HM2170 */
