@@ -172,6 +172,9 @@ MODULE_PARM_DESC(dvdd_cycle_ms,
  * 648 = 640 + 8 horizontal overscan past 2x2-binned 1280.
  * 368 = 360 + 8 vertical overscan past 2x2-binned 720.
  */
+/* full pixel array; the exposed mode is the 2x2 binned window + overscan */
+#define HM1092_NATIVE_WIDTH		1280
+#define HM1092_NATIVE_HEIGHT		720
 #define HM1092_WIDTH			648
 #define HM1092_HEIGHT			368
 /*
@@ -1176,11 +1179,51 @@ static const struct v4l2_subdev_video_ops hm1092_video_ops = {
 	.s_stream = hm1092_set_stream,
 };
 
+/*
+ * libcamera (and anything else following
+ * Documentation/driver-api/media/v4l2-subdev.rst) queries the sensor's crop
+ * rectangles to learn the pixel array geometry. Without this it logs
+ * "Failed to retrieve the sensor crop rectangle" and
+ * "The sensor kernel driver needs to be fixed", then falls back to defaults.
+ *
+ * The HM1092 pixel array is 1280x720. The mode we expose is the 2x2 binned
+ * 640x360 window plus 8px of overscan on each axis, which is what Windows
+ * programs via registers 0x0344-0x034F, giving 648x368 out of a 1293x733
+ * analogue crop.
+ */
+static int hm1092_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	if (sel->pad != 0)
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = HM1092_WIDTH;
+		sel->r.height = HM1092_HEIGHT;
+		return 0;
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = HM1092_NATIVE_WIDTH;
+		sel->r.height = HM1092_NATIVE_HEIGHT;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct v4l2_subdev_pad_ops hm1092_pad_ops = {
 	.enum_mbus_code = hm1092_enum_mbus_code,
 	.enum_frame_size = hm1092_enum_frame_size,
 	.get_fmt = hm1092_get_format,
 	.set_fmt = hm1092_set_format,
+	.get_selection = hm1092_get_selection,
 };
 
 static const struct v4l2_subdev_ops hm1092_subdev_ops = {
