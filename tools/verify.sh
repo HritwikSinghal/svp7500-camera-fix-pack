@@ -46,19 +46,24 @@ if [ "$EUID" -eq 0 ] && [ -n "${SD:-}" ]; then
   # 4096x3072 default, so streaming returns zero frames. Configure the graph
   # first -- resolving entities by NAME, since node numbers shuffle per boot.
   SENS=$(media-ctl -d /dev/media0 -p 2>/dev/null | grep -oE '^- entity [0-9]+: hm1092[^(]*' | sed 's/^- entity [0-9]*: //;s/ *$//' | head -1)
-  CAP=$(media-ctl -d /dev/media0 -p 2>/dev/null | awk '/entity .*Intel IPU7 CSI2 2 /{f=1} f&&/-> "Intel IPU7 ISYS Capture/{gsub(/.*-> "/,"");gsub(/":.*/,"");print;exit}')
+  # The CSI-2 port is NOT the same on every machine: port 2 on the XPS 16,
+  # port 1 on the Dell Pro 14. Follow the sensor's own link instead of guessing.
+  CSI=$(media-ctl -d /dev/media0 -p 2>/dev/null | awk -v s="$SENS" '$0 ~ "entity .*: "s" "{f=1} f&&/-> "/{gsub(/.*-> "/,"");gsub(/":.*/,"");if ($0 ~ /CSI2/){print;exit}}')
+  CSI=${CSI:-Intel IPU7 CSI2 2}
+  CSI_N=$(echo "$CSI" | grep -oE '[0-9]+$')
+  CAP=$(media-ctl -d /dev/media0 -p 2>/dev/null | awk -v c="$CSI" '$0 ~ "entity .*: "c" "{f=1} f&&/-> "Intel IPU7 ISYS Capture/{gsub(/.*-> "/,"");gsub(/":.*/,"");print;exit}')
   if [ -n "${SENS:-}" ] && [ -n "${CAP:-}" ]; then
     media-ctl -d /dev/media0 --set-v4l2 "\"$SENS\":0 [fmt:SGRBG10_1X10/648x368]" 2>/dev/null
-    media-ctl -d /dev/media0 --set-v4l2 '"Intel IPU7 CSI2 2":0 [fmt:SGRBG10_1X10/648x368]' 2>/dev/null
-    media-ctl -d /dev/media0 --set-v4l2 '"Intel IPU7 CSI2 2":1 [fmt:SGRBG10_1X10/648x368]' 2>/dev/null
-    media-ctl -d /dev/media0 -l "\"Intel IPU7 CSI2 2\":1 -> \"$CAP\":0 [1]" 2>/dev/null
+    media-ctl -d /dev/media0 --set-v4l2 "\"$CSI\":0 [fmt:SGRBG10_1X10/648x368]" 2>/dev/null
+    media-ctl -d /dev/media0 --set-v4l2 "\"$CSI\":1 [fmt:SGRBG10_1X10/648x368]" 2>/dev/null
+    media-ctl -d /dev/media0 -l "\"$CSI\":1 -> \"$CAP\":0 [1]" 2>/dev/null
   fi
   dmesg -C >/dev/null 2>&1
   timeout 15 v4l2-ctl -d "${NODE:-/dev/video16}" \
       --set-fmt-video=width=648,height=368,pixelformat=BA10 \
       --stream-mmap --stream-count=5 --stream-to=/dev/null >/dev/null 2>&1
-  SOF=$(dmesg | grep -c 'sof_event::csi2-2')
-  p "SOF on csi2-2" "$SOF $([ "$SOF" -gt 0 ] && echo '<-- STREAMING' || echo '<-- NO FRAMES')"
+  SOF=$(dmesg | grep -c "sof_event::csi2-${CSI_N:-2}")
+  p "SOF on csi2-${CSI_N:-2}" "$SOF $([ "$SOF" -gt 0 ] && echo '<-- STREAMING' || echo '<-- NO FRAMES')"
 else
   p "live capture" "run as root to test"
 fi
