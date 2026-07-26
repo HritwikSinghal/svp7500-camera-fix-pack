@@ -66,8 +66,28 @@ def _set_ir_led(on):
 
 
 SENSOR_ENTITY = "hm1092"
-CSI2_ENTITY = "Intel IPU7 CSI2 2"
+# The CSI-2 port the sensor is wired to is NOT the same on every machine: it is
+# port 2 on the Dell XPS 16 (DA16260) and port 1 on the Dell Pro 14, and the
+# bridge's ACPI id differs too (INTC10E1 vs INTC10DE). Discover it by following
+# the sensor's own link in the media graph rather than hardcoding a port.
 FMT = "SGRBG10_1X10/648x368"
+
+
+def _find_csi2_for(topo, sensor):
+	"""Return the CSI-2 entity that the sensor's source pad feeds."""
+	in_sensor = False
+	for line in topo.splitlines():
+		t = line.strip()
+		if re.match(r"- entity \d+: %s\b" % re.escape(sensor), t):
+			in_sensor = True
+			continue
+		if in_sensor and t.startswith("- entity"):
+			break
+		if in_sensor:
+			m = re.search(r'-> "([^"]*CSI2[^"]*)"', line)
+			if m:
+				return m.group(1)
+	return None
 
 
 def _topology(dev):
@@ -104,10 +124,14 @@ def configure_pipeline():
 		if not sensor:
 			continue
 
+		csi2 = _find_csi2_for(topo, sensor)
+		if not csi2:
+			continue
+
 		cap, in_csi = None, False
 		for line in topo.splitlines():
 			t = line.strip()
-			if re.match(r"- entity \d+: %s\b" % re.escape(CSI2_ENTITY), t):
+			if re.match(r"- entity \d+: %s\b" % re.escape(csi2), t):
 				in_csi = True
 				continue
 			if in_csi and t.startswith("- entity"):
@@ -122,9 +146,9 @@ def configure_pipeline():
 
 		for args in (
 			["--set-v4l2", '"%s":0 [fmt:%s]' % (sensor, FMT)],
-			["--set-v4l2", '"%s":0 [fmt:%s]' % (CSI2_ENTITY, FMT)],
-			["--set-v4l2", '"%s":1 [fmt:%s]' % (CSI2_ENTITY, FMT)],
-			["-l", '"%s":1 -> "%s":0 [1]' % (CSI2_ENTITY, cap)],
+			["--set-v4l2", '"%s":0 [fmt:%s]' % (csi2, FMT)],
+			["--set-v4l2", '"%s":1 [fmt:%s]' % (csi2, FMT)],
+			["-l", '"%s":1 -> "%s":0 [1]' % (csi2, cap)],
 		):
 			try:
 				subprocess.run(["media-ctl", "-d", dev] + args,
