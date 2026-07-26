@@ -30,9 +30,23 @@ warn(){ printf '    \033[33m!\033[0m %s\n' "$*"; }
 # ---------------------------------------------------------------------------
 if [[ $DO_KERNEL -eq 1 ]]; then
 say "Installing DKMS modules"
+# Resolve a module's source directory. The published package lays modules out as
+# dkms/<name>-<version>/ while the development tree uses kernel/<name>/. Looking
+# in only one of them silently skips EVERY module and reports success -- which is
+# exactly what shipped, and it installed nothing at all for anyone who used it.
+find_src() {
+  local m=$1 d
+  for d in "$HERE"/dkms/"$m"-*/ "$HERE/dkms/$m" "$HERE/kernel/$m"; do
+    [[ -d $d && -f $d/dkms.conf ]] && { echo "${d%/}"; return 0; }
+  done
+  return 1
+}
+
 for m in hm1092 intel-cvs int3472-patched ipu-bridge-patched; do
-  src="$HERE/kernel/$m"
-  [[ -d $src ]] || { warn "$m not in package, skipping"; continue; }
+  if ! src=$(find_src "$m"); then
+    warn "$m not found in package (looked in dkms/ and kernel/), skipping"
+    continue
+  fi
   ver=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' "$src/dkms.conf" | head -1)
   ver=${ver:-1.0}
   dst="/usr/src/${m}-${ver}"
@@ -60,7 +74,11 @@ done
 
 # --- vendor IPU7 psys suspend patches --------------------------------------
 say "IPU7 psys suspend patches (s2idle)"
-P="$HERE/kernel/ipu7-psys-patches/psys-suspend-BC.patch"
+P=""
+for c in "$HERE/dkms/ipu7-psys-patches/psys-suspend-BC.patch" \
+         "$HERE/kernel/ipu7-psys-patches/psys-suspend-BC.patch"; do
+  [[ -f $c ]] && { P="$c"; break; }
+done
 SRC=$(dkms status 2>/dev/null | sed -n 's|^ipu7-drivers/\([^,]*\),.*installed.*|\1|p' | head -1)
 if [[ -n ${SRC:-} && -d /usr/src/ipu7-drivers-$SRC && -f $P ]]; then
   # Pick the tree DKMS actually HAS INSTALLED. Selecting with `ls | tail -1`
@@ -74,7 +92,12 @@ if [[ -n ${SRC:-} && -d /usr/src/ipu7-drivers-$SRC && -f $P ]]; then
   # DKMS: they disagree on struct ipu7_device's layout, so the ready_to_probe
   # read lands at the wrong offset. Result is a MISSING /dev/ipu7-psys0 and no
   # RGB camera, while isys binds normally because it ships with the kernel.
-  if bash "$HERE/kernel/ipu7-psys-patches/fix-psys-defer.sh" "/usr/src/ipu7-drivers-$SRC" >/dev/null 2>&1; then
+  DEFERFIX=""
+  for c in "$HERE/kernel/ipu7-psys-patches/fix-psys-defer.sh" \
+           "$HERE/dkms/ipu7-psys-patches/fix-psys-defer.sh"; do
+    [[ -f $c ]] && { DEFERFIX="$c"; break; }
+  done
+  if [[ -n $DEFERFIX ]] && bash "$DEFERFIX" "/usr/src/ipu7-drivers-$SRC" >/dev/null 2>&1; then
     ok "psys defer check neutralised"
   else
     warn "psys defer fix did not apply — check /dev/ipu7-psys0 after reboot"
@@ -86,7 +109,13 @@ if [[ -n ${SRC:-} && -d /usr/src/ipu7-drivers-$SRC && -f $P ]]; then
     dkms install "ipu7-drivers/$SRC" -k "$k" >/dev/null 2>&1 && ok "ipu7-drivers -> $k" || warn "ipu7-drivers failed for $k"
   done
 else
-  warn "ipu7-drivers DKMS not installed — skipping psys patches"
+  if [[ -z ${SRC:-} ]]; then
+    warn "ipu7-drivers DKMS not installed — skipping psys patches"
+  elif [[ -z ${P:-} ]]; then
+    warn "psys patch file not found in this package — skipping (this is a packaging bug)"
+  else
+    warn "/usr/src/ipu7-drivers-$SRC missing — skipping psys patches"
+  fi
 fi
 fi
 
