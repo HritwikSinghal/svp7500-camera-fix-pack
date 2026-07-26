@@ -6,7 +6,9 @@
 # "CVS" bridge on Intel IPU7 (Panther Lake / Lunar Lake class), and wires it
 # into Howdy for IR face authentication.
 #
-# Tested on: Dell XPS 16 (DA16260), CachyOS, kernels 7.1.x / 7.2-rc
+# Tested on: Dell XPS 16 (DA16260), CachyOS, kernels 7.0.5 through 7.2.0-rc4
+#            (including stock linux-cachyos 7.1.4 — no custom kernel needed).
+#            Also reported working on Arch and Ubuntu by other users.
 # ===========================================================================
 set -euo pipefail
 
