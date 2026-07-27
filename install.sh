@@ -1403,6 +1403,43 @@ fi
 fi
 
 # ---------------------------------------------------------------------------
+# PipeWire is the layer that hands these cameras to applications. Without this
+# configuration the kernel side can be perfect and every browser and video app
+# still sees no camera. A reporter spent six rounds on a kernel device node with
+# `cam -l` listing both cameras the whole time, because none of this was ever
+# installed by the package.
+say "PipeWire / WirePlumber camera configuration"
+WPD=/usr/share/wireplumber/wireplumber.conf.d
+WP_OK=0 WP_FAIL=0
+if [[ ! -d $(dirname "$WPD") ]]; then
+  skip_step "wireplumber is not installed — camera config not written; without it your apps will see no camera even though the kernel side works"
+else
+  for f in "$HERE"/wireplumber/*.conf; do
+    [[ -f $f ]] || continue
+    n=$(basename "$f")
+    if [[ $DRY_RUN -eq 1 ]]; then
+      plan "would install: $WPD/$n"; WP_OK=$((WP_OK+1))
+    elif install -Dm644 "$f" "$WPD/$n" 2>/dev/null; then
+      ok "$n"; WP_OK=$((WP_OK+1))
+    else
+      bad "failed to install $n to $WPD"; WP_FAIL=$((WP_FAIL+1))
+    fi
+  done
+  if [[ $WP_OK -eq 0 && $WP_FAIL -eq 0 ]]; then
+    bad "no wireplumber configs found in $HERE/wireplumber — packaging bug; apps will see no camera"
+    action "re-download the package: the wireplumber/ directory is missing"
+  elif [[ $WP_FAIL -gt 0 ]]; then
+    action "install the wireplumber configs by hand from $HERE/wireplumber/ into $WPD"
+  elif [[ $DRY_RUN -ne 1 ]]; then
+    # wireplumber is a --user unit; restarting it needs the user's own bus, not
+    # root's. Say what to run rather than pretending we did it.
+    warn "restart wireplumber for these to take effect"
+    action "as your normal user (not root): systemctl --user restart wireplumber, then check 'wpctl status | grep -A6 Video' lists both cameras as [libcamera]"
+  fi
+fi
+
+
+# ---------------------------------------------------------------------------
 if [[ $DO_HOWDY -eq 1 ]]; then
 say "Howdy IR integration"
 # Howdy's recorders directory moves between versions and packagings. Asserting
