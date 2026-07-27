@@ -1,129 +1,383 @@
 # SVP7500 + Intel IPU7 Camera Fix Pack
 
-Restore RGB camera functionality on Linux for laptops with the Synaptics SVP7500 CVS bridge (USB `06CB:0701`) and Intel IPU7 (Panther Lake / Lunar Lake).
+**What this is:** a set of DKMS kernel modules that make the built-in camera work
+on Linux laptops where the webcam is a MIPI sensor behind a **Synaptics SVP7500
+"CVS" bridge** (USB `06CB:0701`) wired to an **Intel IPU7** imaging unit —
+recent Dell XPS / Dell Pro / Latitude and similar Meteor/Arrow/Lunar/Panther
+Lake machines. **Who needs it:** anyone on those machines whose camera produces
+no device at all, or a device that never delivers a frame, on a stock kernel.
+**Who does not:** if your webcam is an ordinary USB UVC device — the vast
+majority of laptops, including most non-Dell machines — nothing here applies and
+you should not install it.
 
-> **Testing scope.** Developed on **CachyOS** on a Dell XPS 16 (DA16260), and
-> verified across **kernels 7.0.5 through 7.2.0-rc4** — including **stock
-> `linux-cachyos` 7.1.4**, so a custom kernel is *not* required. Earlier versions
-> of this note said 7.0.5 only and implied our patched `susfix` kernel was
-> needed; both were out of date.
->
-> Confirmed by other people on hardware we do not own: **Arch** (7.1.5, and a
-> Dell Pro 14 on CSI-2 port 1 with an `INTC10DE` bridge), **CachyOS 7.1.4** on a
-> different machine, and **Ubuntu** on a Dell Pro 14 Plus PB14250. The DKMS
-> modules are plain C against the kernel API and carry no distro assumptions, so
-> Fedora and Debian should work too — untested, and reports are welcome.
->
-> The `link_frequency = 180480000` fix has now been independently confirmed on
-> **three** additional machines.
->
-> Specifically untested:
-> - Fedora 43/44 (regular workstation) — should work, kernel version compatible
-> - Fedora 44 Silverblue — DKMS on an immutable OS is finicky; you'll likely need `rpm-ostree install dkms kernel-devel` followed by a reboot before running our installer. Layering DKMS modules on Silverblue is known-awkward.
-> - Ubuntu / Debian — should work with `linux-headers-$(uname -r)`
-> - Stock Arch / EndeavourOS — should work; we run a custom kernel but the DKMS modules don't depend on those custom patches
+Run the [hardware check](#step-0--check-your-hardware-first-2-minutes) below
+before you install anything. It takes two minutes and tells you definitively
+whether this package is for your machine.
 
-## Which problem do you have?
+> ### Testing scope — please read
+>
+> **The author owns and verifies exactly one machine:** a Dell XPS 16 (DA16260,
+> Panther Lake) on CachyOS, across kernels **7.0.5 through 7.2.0-rc4** including
+> **stock `linux-cachyos` 7.1.4** — so a custom kernel is *not* required. On that
+> one machine the full stack is verified end to end: RGB camera, IR camera
+> streaming, and Howdy face unlock.
+>
+> **Everything else is third-party reports**, not something the author can
+> reproduce or debug directly:
+>
+> | reporter | machine | distro | reported |
+> |---|---|---|---|
+> | @acmodeu | Dell Pro 14 PB14250 (CSI-2 port 1) | Arch / CachyOS | install OK; surfaced the port-1 difference |
+> | @Aohzan | Dell Pro 14 (`INTC10DE` bridge) | Arch | surfaced the differing bridge ACPI id |
+> | @dalandro | Dell Pro 14 Plus PB14250 | Ubuntu | RGB path, OV05C10 sensor |
+> | @tverhaeghe | Dell XPS 16 DA16260 | Fedora 44 Silverblue | RGB working ([vision-drivers#37](https://github.com/intel/vision-drivers/issues/37)) |
+>
+> **IR streaming and Howdy face unlock have not been independently confirmed on
+> hardware other than the author's.** The RGB path has. If you get IR working
+> (or not) on a different machine, a report is genuinely valuable.
+>
+> The DKMS modules are plain C against the kernel API with no distro
+> assumptions, so Fedora, Debian and stock Arch should work — untested by the
+> author. On **Fedora Silverblue** you will likely need
+> `rpm-ostree install dkms kernel-devel` and a reboot first; layering DKMS on an
+> immutable OS is known-awkward.
 
-There are **two completely different kinds of laptop IR camera**, and the fixes
-have nothing in common. Check before you spend time here:
+---
+
+## Step 0 — check your hardware FIRST (2 minutes)
+
+Run this whole block. It is read-only and changes nothing.
 
 ```bash
-# Is your IR camera a USB UVC webcam?
-lsusb -v 2>/dev/null | grep -B4 'bInterfaceClass.*14 Video'
-ls /sys/bus/usb/drivers/uvcvideo/
+echo "--- 1. CVS bridge (Synaptics SVP7500) ---"
+lsusb -d 06cb:0701 || echo "NOT PRESENT"
 
-# Or a MIPI sensor behind an Intel IPU?
-v4l2-ctl --list-devices | grep -A2 ipu
+echo "--- 2. Bridge ACPI id ---"
+ls /sys/bus/i2c/devices/ 2>/dev/null | grep -iE 'INTC10(CF|DE|E0|E1)' || echo "none"
+
+echo "--- 3. Sensors the firmware declares ---"
+ls /sys/bus/acpi/devices/ 2>/dev/null | grep -iE 'HIMX1092|OVTI08F4|OVTI05C1|INT3472' || echo "none"
+
+echo "--- 4. Intel IPU present? ---"
+lspci -nn | grep -iE 'image signal|imaging|IPU' || echo "no IPU on PCI"
+
+echo "--- 5. Is it actually a plain USB webcam? ---"
+ls /sys/bus/usb/drivers/uvcvideo/ 2>/dev/null | grep -q ':' && echo "UVC WEBCAM BOUND — see table below" || echo "no UVC webcam"
 ```
 
-| your camera | what you need |
+### Reading the result
+
+**This package is for you** if you see the bridge in (1) *or* an `INTC10xx` id in
+(2), plus a sensor in (3). The bridge id tells you your platform:
+
+| ACPI id | platform |
 |---|---|
-| **USB UVC IR webcam** (`uvcvideo` bound, interface class 14) | **not this repo** — use [linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter), which flips the vendor UVC control that switches the emitter on |
-| **MIPI CSI-2 sensor on Intel IPU6/IPU7** (driver `intel-ipu7`/`ipu6`, sensor in the media graph, bridge is USB class 255 vendor-specific) | **this repo** |
+| `INTC10CF` | Meteor Lake |
+| `INTC10DE` | Lunar Lake |
+| `INTC10E0` | Arrow Lake |
+| `INTC10E1` | Panther Lake |
 
-On IPU platforms the sensor is not a USB webcam at all — it reaches the host
-over MIPI CSI-2 through the IPU, and the Synaptics bridge exposes only a
+Sensors you may see in (3): `OVTI08F4` (OV08x40, RGB), `OVTI05C1` (OV05C10,
+RGB), `HIMX1092` (HM1092, IR). `INT3472` is the power/GPIO controller that owns
+the IR illuminator.
+
+**MIPI/IPU sensor vs UVC webcam** — this is the distinction that matters most:
+
+| what you have | how you can tell | what you need |
+|---|---|---|
+| **MIPI CSI-2 sensor on an Intel IPU** | sensor appears in the media graph (`media-ctl -p`), bridge is USB **class 255 vendor-specific**, no UVC interface, `uvcvideo` binds nothing | **this repo** |
+| **USB UVC webcam** | `lsusb -v` shows `bInterfaceClass 14 Video`, `uvcvideo` is bound, `/dev/video0` exists and works in any app | **not this repo.** For a UVC IR emitter use [linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter) |
+
+On IPU platforms the sensor is not a USB webcam at all: it reaches the host over
+MIPI CSI-2 through the IPU, and the Synaptics bridge exposes only a
 vendor-specific bulk interface carrying an I2C tunnel. There is no UVC device to
-send a control to, so UVC-based tools cannot help, and conversely nothing here
-applies to a UVC webcam.
+send a control to, so UVC-based tools cannot possibly help — and conversely
+nothing here applies to a UVC webcam.
 
-## Affected hardware
+### Machines this does NOT help
 
-Confirmed working:
-- Dell XPS 16 DA16260 (Panther Lake) on CachyOS — primary dev hardware
-- Dell XPS 16 DA16260 (Panther Lake) on Fedora 44 Silverblue — independently confirmed by @tverhaeghe (intel/vision-drivers#37)
-- Dell Pro 14 PB14250 (Lunar Lake) on Arch — install confirmed by @acmodeu (intel/ipu7-drivers#26), streaming TBD
+Stop here and do not install if any of these describe you:
 
-Likely also helps (untested by us, please report):
-- Dell Latitude 9440 / 7440 / 7450
-- Lenovo ThinkPad X9
-- Dell Pro Max 16 MA16250
-- ASUS Vivobook X1407Q (Snapdragon X — different host, same sensor)
-- Any laptop with Intel IPU7 + Synaptics SVP7500 + OV08x40/HM1092 sensors
+- **`uvcvideo` is bound to your camera** — you have an ordinary USB webcam. If it
+  is broken, this is not the cause.
+- **No `06cb:0701` and no `INTC10xx`** — you do not have a CVS bridge. Some
+  laptops have IPU cameras with a *different* bridge; this pack does not cover them.
+- **IPU6 machines** (Tiger/Alder/Raptor Lake, `intel-ipu6` driver) — related
+  stack, different target. See [intel/ipu6-drivers](https://github.com/intel/ipu6-drivers).
+- **AMD, Qualcomm/Snapdragon or Apple silicon laptops** — no Intel IPU.
+- **Your camera already works.** This pack replaces core camera modules; there is
+  no upside and a real downside.
 
-## What you get
+---
 
-| Status | Camera |
-|--------|--------|
-| ✅ Works | RGB front-facing camera (OV08x40) — for video calls, photos, etc. |
-| ✅ **Working** | **IR camera (HM1092)** — Windows Hello-style face auth via Howdy |
+## Step 1 — prerequisites
 
-## Quick install
-
-> 🛟 **Back up your kernel + initramfs first.** DKMS modules can occasionally break boot if they fail to load and something on the boot path depends on them. These camera modules shouldn't be on the boot path, but be safe:
->
-> ```bash
-> sudo cp /boot/vmlinuz-$(uname -r){,.pre-svp7500-fix.bak}
-> sudo cp /boot/initramfs-$(uname -r).img{,.pre-svp7500-fix.bak}  # Fedora/RHEL
-> # OR
-> sudo cp /boot/initrd.img-$(uname -r){,.pre-svp7500-fix.bak}     # Debian/Ubuntu
-> # OR (Arch / CachyOS)
-> sudo cp /boot/initramfs-linux*.img{,.pre-svp7500-fix.bak}
-> ```
->
-> If you're on Btrfs with `snapper`, just take a snapshot:
-> `sudo snapper create --description "pre-svp7500-fix"`
->
-> **Recovery if something breaks:** boot to your previous kernel entry (most bootloaders keep one), then:
-> ```bash
-> sudo dkms remove -m intel-cvs -v 1.0 --all
-> sudo dkms remove -m hm1092 -v 1.0 --all
-> sudo dkms remove -m int3472-patched -v 1.0 --all
-> sudo dkms remove -m ipu-bridge-patched -v 1.0 --all
-> sudo rm -f /etc/udev/rules.d/99-svp7500-no-autosuspend.rules
-> sudo reboot
-> ```
-
-Requires DKMS and kernel headers:
 ```bash
-# Fedora
-sudo dnf install dkms kernel-devel
-
 # Arch / CachyOS
-sudo pacman -S dkms linux-headers
+sudo pacman -S dkms linux-headers v4l-utils
+
+# Fedora
+sudo dnf install dkms kernel-devel v4l-utils
 
 # Debian / Ubuntu
-sudo apt install dkms "linux-headers-$(uname -r)"
+sudo apt install dkms "linux-headers-$(uname -r)" v4l-utils
 ```
 
-Then:
+Optional but recommended on Btrfs: `sudo snapper create -d "pre-svp7500-fix"`.
+
+## Step 2 — install
+
 ```bash
-sudo ./install.sh
+git clone https://github.com/jibsta210/svp7500-camera-fix-pack
+cd svp7500-camera-fix-pack
+sudo ./install.sh            # add --kernel-only if you do not use Howdy
+```
+
+**What to expect.** The installer builds every module against *every* installed
+kernel, so you get one `✓` line per module per kernel:
+
+```
+==> Installing DKMS modules
+    ✓ hm1092 -> 7.1.4-2-cachyos
+    ✓ hm1092 -> 7.2.0-rc4-1-cachyos
+    ✓ intel-cvs -> 7.1.4-2-cachyos
+    ...
+```
+
+Read those lines before you reboot. They are the only proof anything happened:
+
+| line | meaning |
+|---|---|
+| `✓ <module> -> <kernel>` | built and installed for that kernel |
+| `! <module> failed for <kernel>` | build error — missing headers for *that* kernel is the usual cause |
+| `! <module> not found in package (looked in dkms/ and kernel/)` | **packaging bug — please report it.** Do not reboot expecting a fix; nothing was installed |
+
+The psys section may legitimately say `ipu7-drivers DKMS not installed —
+skipping psys patches`. That is **fine and expected** if you do not have Intel's
+`ipu7-drivers` DKMS package (many distros ship IPU7 in-kernel). It is *not* a
+sign your DKMS install is broken. By contrast, `psys patch file not found in
+this package` is a packaging bug on our side — report that one.
+
+## Step 3 — reboot
+
+```bash
 sudo reboot
 ```
 
-After reboot:
+**A reboot is required, not optional.** `hm1092` leaks module references and can
+never be swapped live: unbind succeeds, the refcount stays above zero, and
+`rmmod` reports the module in use.
+
+---
+
+## Verification
+
 ```bash
-cam --list                                # should show 1 camera (your front-facing RGB)
-cam --camera=1 --capture=5 --file=/tmp/test.raw    # capture 5 frames
+sudo ./tools/verify.sh
 ```
 
-If the camera does not show up, check `sudo dmesg | grep -E 'Intel CVS|hm1092|ov08x40'` and report results to https://github.com/intel/vision-drivers/issues/37
+Run it as **root** — the live capture test is skipped otherwise.
+
+### What a HEALTHY machine prints
+
+```
+=== IPU7 IR stack verification — 7.2.0-rc4-1-cachyos ===
+  module intel_ipu7                  loaded
+  module intel_ipu7_isys             loaded
+  module intel_ipu7_psys             loaded
+  module intel_cvs                   loaded
+  module hm1092                      loaded
+  /dev/ipu7-psys0                    present          <-- the one that matters
+  loaded modules match disk          yes              <-- no stale initramfs copy
+  link_frequency                     180480000 (CORRECT)
+  psys suspend patches               2/2
+  IR flood LED                       present (=0)     <-- 0 is CORRECT when idle
+  howdy ir_reader                    installed
+
+--- live IR capture (needs root) ---
+  SOF on csi2-2                      9 <-- STREAMING
+```
+
+Three of those lines are routinely misread, so to be explicit:
+
+- **`/dev/ipu7-psys0 present`** is the load-bearing line for the RGB camera. If
+  it says `MISSING`, the camera will not work no matter what else looks good.
+- **`psys suspend patches 2/2` does NOT mean the psys stack is healthy.** It only
+  counts two *suspend* fixes inside the built module. It can read `2/2` while
+  `/dev/ipu7-psys0` is `MISSING` and the camera is completely dead. Always read
+  the `psys0` line first; `2/2` answers a different question. (This line is
+  absent entirely on distros that do not ship the DKMS psys module — also fine.)
+- **`IR flood LED present (=0)`** — `0` is correct. The illuminator is off in
+  standby by design and only lights during capture, matching Windows. A stock
+  implementation leaves it on 24/7.
+
+`link_frequency`, the LED and the capture lines only appear if you have the IR
+sensor. On an RGB-only board (e.g. OV05C10 machines) their absence is normal.
+
+### What a BROKEN machine prints
+
+```
+  /dev/ipu7-psys0                    MISSING
+      -> intel_ipu7:      kernel
+      -> intel_ipu7_psys: dkms
+      -> split provenance means the defer check reads garbage. Fix:
+         sudo kernel/ipu7-psys-patches/fix-psys-defer.sh
+      -> kernel says:
+           intel_ipu7_psys: probe deferred
+      -> aux device: ABSENT (intel_ipu7 never created it)
+  STALE MODULES (loaded build != build on disk):
+      ipu_bridge  loaded=1a2b3c4d...  disk=9f8e7d6c...
+      -> the running kernel is NOT using what you just built.
+         Regenerate the initramfs and reboot:  sudo mkinitcpio -P
+```
+
+Two failure modes worth naming, because both cost real debugging hours:
+
+1. **Split provenance.** `intel_ipu7` from the kernel + `intel_ipu7_psys` from
+   DKMS means the two disagree about `struct ipu7_device`'s layout, so the
+   readiness check reads the wrong offset and psys defers forever. `isys` binds
+   normally because it ships with the kernel, which makes the failure look
+   selective and sends people hunting the wrong component.
+2. **Stale modules.** *A DKMS rebuild does not regenerate the initramfs.* If a
+   module ships in the initramfs, the kernel keeps loading the **old** build no
+   matter how many times you rebuild — and every downstream symptom points
+   somewhere else. Fix with `sudo mkinitcpio -P` (Arch/CachyOS),
+   `sudo dracut -f` (Fedora), or `sudo update-initramfs -u` (Debian/Ubuntu),
+   then reboot.
+
+For the RGB camera specifically:
+
+```bash
+cam --list                                         # expect 1 camera
+cam --camera=1 --capture=5 --file=/tmp/test.raw    # expect 5 frames
+```
+
+For the IR node and CSI-2 port:
+
+```bash
+./tools/find-ir-node.sh
+```
+
+It reports the CSI-2 port as either `auto-detected from the sensor's link` or
+`GUESSED — could not follow the sensor's link`. If it says GUESSED, the value is
+a fallback and probably wrong for your machine — include that output in a report.
+
+---
+
+## Recovery — if the camera does not come back
+
+**Nothing in this pack is in the boot path.** These are camera modules: `hm1092`,
+`intel_cvs`, `ipu-bridge`, `int3472`, `ov05c10`. A module that fails to build or
+load costs you a camera, not a bootable system. There is no scenario in which
+removing them is required to boot.
+
+**Your other kernels keep working copies.** The installer builds per-kernel, and
+a failure on one kernel does not touch the modules already installed for another.
+If a specific kernel misbehaves, pick a different entry in your bootloader menu
+and you are back to a known state.
+
+To back the whole thing out:
+
+```bash
+for m in intel-cvs hm1092 int3472-patched ipu-bridge-patched ov05c10; do
+  sudo dkms remove -m $m -v 1.0 --all 2>/dev/null
+done
+sudo rm -f /etc/udev/rules.d/99-svp7500-no-autosuspend.rules \
+           /etc/udev/rules.d/99-hm1092-ir-led.rules
+sudo rm -rf /usr/src/intel-cvs-1.0 /usr/src/hm1092-1.0 \
+            /usr/src/int3472-patched-1.0 /usr/src/ipu-bridge-patched-1.0 \
+            /usr/src/ov05c10-1.0
+sudo udevadm control --reload-rules
+sudo mkinitcpio -P      # or: dracut -f  /  update-initramfs -u
+sudo reboot
+```
+
+The installer backs up anything it replaces: previous `/usr/src/<module>-<ver>`
+trees become `.bak-<timestamp>`, and Howdy's `video_capture.py` and
+`config.ini` are copied aside the same way before being touched.
+
+---
+
+## Known-different hardware
+
+The author's machine is **not** representative, and four things vary between
+otherwise-similar laptops. All four are now discovered at runtime rather than
+hardcoded:
+
+| varies | example spread | how it is handled |
+|---|---|---|
+| **CSI-2 port** | port 2 on XPS 16 DA16260, **port 1** on Dell Pro 14 | followed from the sensor's own link in the media graph |
+| **I2C bus number** | appears in the entity name (`hm1092 12-0024` vs `5-0024`) | entities resolved by name, never by bus |
+| **Bridge ACPI id** | `INTC10E1` (PTL) vs **`INTC10DE`** (LNL), plus `INTC10CF`/`INTC10E0` | all four in the driver's match table |
+| **IR LED ownership** | INT3472 owns the illuminator GPIO, not the sensor driver | udev rule grants the `video` group access so Howdy can fire it unprivileged |
+
+`/dev/videoN`, `/dev/v4l-subdevN` and libcamera indexes **shuffle between boots**
+even on one machine, so nothing should ever be hardcoded to a number.
+
+These differences were only discoverable because people ran this on hardware the
+author does not own and reported precisely what differed. Thanks to
+**@acmodeu** (CSI-2 port 1 on the Dell Pro 14), **@Aohzan** (the `INTC10DE`
+bridge id), and **@dalandro** (Dell Pro 14 Plus PB14250 on Ubuntu, OV05C10
+sensor). Every one of those was a wrong assumption baked into the tooling.
+
+---
+
+## If it does not work, what to send me
+
+Open an issue with the output of **all** of these. Every slow diagnosis so far
+started with a report missing one of them — most often the module paths, which
+are what reveal a stale or split-provenance install.
+
+```bash
+# 1. the whole stack, one command (this is the important one)
+sudo ./tools/verify.sh 2>&1 | tee /tmp/svp7500-report.txt
+
+# 2. environment
+uname -r; head -2 /etc/os-release
+
+# 3. what DKMS thinks is installed, for which kernels
+dkms status
+
+# 4. WHERE each module is actually loaded from — kernel vs updates/dkms.
+#    This is what exposes split provenance and stale builds.
+for m in intel_ipu7 intel_ipu7_isys intel_ipu7_psys ipu_bridge intel_cvs hm1092 ov05c10; do
+  printf '%-20s %s\n' "$m" "$(modinfo -n $m 2>&1)"
+done
+
+# 5. kernel messages from the camera stack
+sudo dmesg | grep -iE 'ipu7|ipu-bridge|intel_cvs|hm1092|ov08x40|ov05c10|int3472'
+
+# 6. the media graph (entity names, ports, links)
+media-ctl -d /dev/media0 -p
+
+# 7. your hardware ids
+lsusb -d 06cb:0701; ls /sys/bus/i2c/devices/ | grep -i INTC
+```
+
+For reference, a healthy install on the author's machine shows this provenance in
+step 4 — `intel_ipu7`/`isys` from the kernel tree and the rest from
+`updates/dkms`:
+
+```
+intel_ipu7           /lib/modules/<ver>/kernel/drivers/staging/media/ipu7/intel-ipu7.ko.zst
+intel_ipu7_isys      /lib/modules/<ver>/kernel/drivers/staging/media/ipu7/intel-ipu7-isys.ko.zst
+intel_ipu7_psys      /lib/modules/<ver>/updates/dkms/intel-ipu7-psys.ko.zst
+ipu_bridge           /lib/modules/<ver>/updates/dkms/ipu-bridge.ko.zst
+intel_cvs            /lib/modules/<ver>/updates/dkms/intel_cvs.ko.zst
+hm1092               /lib/modules/<ver>/updates/dkms/hm1092.ko.zst
+```
+
+Paths differ legitimately across distros (`.ko` vs `.ko.zst`, `extra/` vs
+`updates/dkms/`); what matters is that a module is not loaded from two places
+and not older than what you just built.
+
+Issue tracker: [intel/vision-drivers#37](https://github.com/intel/vision-drivers/issues/37)
+
+---
 
 ## What's in here
 
-5 components, each fixes a different piece of the broken stack:
+6 components, each fixing a different piece of the broken stack.
 
 ### 1. `intel-cvs` DKMS (the headline fix)
 - Patches `cvs_init()` to remove a buggy `IRQF_ONESHOT` flag from `devm_request_irq()`. The flag was meaningless on a non-threaded handler and caused a kernel WARNING. **More importantly: it made IRQ delivery from the SVP7500 unreliable, which is why the bridge wedges itself after brief idle periods.**
@@ -144,11 +398,12 @@ If the camera does not show up, check `sudo dmesg | grep -E 'Intel CVS|hm1092|ov
 
 ### 5. `ov05c10` DKMS
 - RGB sensor driver for boards that pair the SVP7500 bridge with the **OV05C10** (`OVTI05C1`) sensor — e.g. the **Dell Pro Plus 14 PB14250** — instead of the OV08x40 used on the DA16260.
-- The driver is the out-of-tree Intel one from [`intel/ipu6-drivers`](https://github.com/intel/ipu6-drivers) (`drivers/media/i2c/ov05c10.c`); it was never mainlined, so affected boards have no RGB camera until it's installed. The bridge half already enumerates `OVTI05C1` — this supplies the missing sensor driver.
+- The driver is the out-of-tree Intel one from [`intel/ipu6-drivers`](https://github.com/intel/ipu6-drivers) (`drivers/media/i2c/ov05c10.c`); it was never mainlined, so affected boards have no RGB camera until it is installed. The bridge half already enumerates `OVTI05C1` — this supplies the missing sensor driver.
 - Packaged as DKMS so it survives kernel upgrades. Builds clean against 6.18 / 7.0 / 7.1.
 
-### 6. udev rule
-- Disables USB autosuspend on the SVP7500 device. Bridge firmware appears to have issues with power state transitions; keeping it always-on prevents some failure modes.
+### 6. udev rules
+- Disables USB autosuspend on the SVP7500. Bridge firmware has trouble with power state transitions; keeping it always-on prevents some failure modes.
+- Grants the `video` group write access to the IR illuminator's brightness, so Howdy can fire it as an unprivileged user from a lock screen.
 
 ## Why this needed reverse engineering at all
 
@@ -158,7 +413,8 @@ This fix pack is the result of three months of community reverse-engineering: US
 
 ### IR camera — SOLVED (2026-07-25)
 
-The IR camera streams, and Howdy authenticates against it from the lock screen.
+The IR camera streams, and Howdy authenticates against it from the lock screen —
+verified on the author's machine.
 
 **Root cause: `V4L2_CID_LINK_FREQ` was set to the MIPI per-lane bit rate instead
 of the DDR clock — exactly 2x too high.** `ipu7-isys` therefore programmed the
@@ -222,20 +478,6 @@ Gotchas that cost real debugging time:
   the illuminator needs `udev/99-hm1092-ir-led.rules` or it silently never fires
   and every frame is too dark to detect a face.
 
-## Uninstall
-
-```bash
-sudo dkms remove -m intel-cvs -v 1.0 --all
-sudo dkms remove -m hm1092 -v 1.0 --all
-sudo dkms remove -m int3472-patched -v 1.0 --all
-sudo dkms remove -m ipu-bridge-patched -v 1.0 --all
-sudo rm -f /etc/udev/rules.d/99-svp7500-no-autosuspend.rules
-sudo rm -rf /usr/src/intel-cvs-1.0 /usr/src/hm1092-1.0 \
-            /usr/src/int3472-patched-1.0 /usr/src/ipu-bridge-patched-1.0
-sudo udevadm control --reload-rules
-sudo reboot
-```
-
 ## License
 
 The DKMS modules contain code from Intel (`intel-cvs`, `ipu-bridge`), Himax (sensor reference), and original work on top. License terms inherit from each upstream component — primarily GPL-2.0.
@@ -244,5 +486,6 @@ The DKMS modules contain code from Intel (`intel-cvs`, `ipu-bridge`), Himax (sen
 
 - @jibsta210 — patch development, reverse engineering, testing
 - @tverhaeghe — USBPcap traces from Windows on matching hardware (the key dataset)
+- @acmodeu, @Aohzan, @dalandro — testing on hardware the author does not own; between them they surfaced the CSI-2 port, bridge ACPI id and sensor differences that the tooling now discovers instead of assuming
 - Intel `vision-drivers` and `ipu7-drivers` upstream maintainers — for the base code we patched
 - Hans de Goede (@hdegoede) — Linux mainline IPU6/7 camera maintainer
