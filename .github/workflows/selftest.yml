@@ -69,6 +69,60 @@ jobs:
         working-directory: /tmp/asif
         run: ./install.sh --help
 
+  installer-behaviour:
+    name: the installer must fail when the install failed
+    runs-on: ubuntu-latest
+    # selftest checks that install.sh can FIND things. This job is the only one
+    # that checks what it REPORTS. Three mutants of install.sh -- the
+    # mutually-exclusive-flags no-op, every `dkms install` neutered, and an
+    # initramfs failure no longer setting RC -- all passed selftest with 0
+    # failures and CI green. Every one of them exits 0 on a machine where
+    # nothing was installed, which is the single bug this package exists to
+    # stop shipping.
+    #
+    # tools/behaviour-test.sh runs install.sh for real, inside a private mount +
+    # user namespace with a fabricated /lib/modules, /usr/src, /sys and a PATH
+    # of shims whose exit codes each scenario controls. No hardware, no root,
+    # nothing on the runner is touched.
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor. The
+      # harness falls back to root if this does not take, and exits 3 rather
+      # than pretending to have run if neither works.
+      - name: allow the sandbox (unprivileged user namespaces)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
+          unshare --user --map-root-user --mount --propagation private true \
+            && echo "unprivileged user namespaces: available" \
+            || echo "unprivileged user namespaces: NOT available — the harness will fall back to root"
+
+      - name: the exit-code contract (tools/behaviour-test.sh)
+        run: |
+          set +e
+          ./tools/behaviour-test.sh; rc=$?
+          if [ "$rc" -eq 3 ]; then
+            echo "::notice::no unprivileged user namespace on this runner; retrying under sudo"
+            sudo ./tools/behaviour-test.sh; rc=$?
+          fi
+          [ "$rc" -eq 0 ] || { echo "FAIL: install.sh did not honour its exit-code contract"; exit 1; }
+
+      # A harness nobody has watched fail is not yet a harness. --prove
+      # reintroduces the three mutants above, one at a time, and requires the
+      # matching scenario to reject each -- having first confirmed on an
+      # unmutated copy that the scenario passes on correct code, so "it fails on
+      # everything" cannot be mistaken for "it caught something".
+      - name: prove the harness can fail (mutation check)
+        run: |
+          set +e
+          ./tools/behaviour-test.sh --prove; rc=$?
+          if [ "$rc" -eq 3 ]; then sudo ./tools/behaviour-test.sh --prove; rc=$?; fi
+          [ "$rc" -eq 0 ] || { echo "FAIL: a broken install.sh went unnoticed"; exit 1; }
+
+      - name: the scenario table, for the record
+        run: ./tools/behaviour-test.sh --list
+
   refuses-wrong-hardware:
     name: the tools must refuse a machine that is not a candidate
     runs-on: ubuntu-latest
