@@ -129,15 +129,7 @@ else
       ok "suspend patches already applied"
     fi
   fi
-  # Off by default since v1.1. Measured 2026-07-27: without the skip this
-  # machine gets /dev/ipu7-psys0 and "IPU psys probe done", so it was never
-  # needed here; WITH the skip a reporter's machine got "psys device_register
-  # failed" (-22), because psys probed before intel_ipu7 was ready. The check
-  # exists for a reason and removing it unconditionally turns a hang into a
-  # crash. Opt in with WANT_DEFER_FIX=1 only if you have established you need it.
-  if [[ ${WANT_DEFER_FIX:-0} -ne 1 ]]; then
-    warn "psys defer fix NOT applied (off by default — set WANT_DEFER_FIX=1 if you have established you need it)"
-  elif [[ -f $PATCHDIR/fix-psys-defer.sh ]]; then
+  if [[ -f $PATCHDIR/fix-psys-defer.sh ]]; then
     # Do NOT wrap this in run() with output redirected: the redirect swallows
     # run()'s "would run" line and the success branch then claims the patch was
     # applied during a dry run. Reporting success for something that did not

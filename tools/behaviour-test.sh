@@ -1435,7 +1435,7 @@ assert_full_success(){
   expect_say 'initramfs *: regenerated' "the initramfs was regenerated"
   expect_say "$KA .* <- the kernel you are running now" "which kernel you are on"
   expect_say 'suspend patch applied' "the psys suspend patch"
-  expect_say 'psys defer fix NOT applied' "that the defer fix was deliberately skipped"
+  expect_say 'psys defer check neutralised' "the psys defer fix"
   expect_say 'patched video_capture.py' "the Howdy hook"
   expect_say 'recording_plugin=ir, dark_threshold=90, timeout=6' "the Howdy config"
   expect_silent 'NOT INSTALLED for any kernel' "any module missing"
@@ -1456,17 +1456,10 @@ assert_full_success(){
   if grep -q 'ir_reader' "$SB/howdyroot/recorders/video_capture.py"; then
     pass "video_capture.py really carries the ir hook"
   else fail "video_capture.py has no ir hook"; SC_FAILS=$((SC_FAILS+1)); fi
-  # The defer skip is OFF by default since v1.1, so a default run must leave the
-  # vendor tree's check INTACT. Measured 2026-07-27: without the skip this
-  # hardware gets /dev/ipu7-psys0 and "IPU psys probe done", so it was never
-  # needed here; WITH it a reporter's machine got "psys device_register failed"
-  # (-22) because psys probed before intel_ipu7 was ready. Asserting the check
-  # survives asserts that we no longer modify a vendor tree by default on the
-  # strength of one machine's symptom.
-  if grep -q 'ready_to_probe' \
+  if grep -q 'DKMS struct layout mismatch' \
       "$SB/root/usr-src/ipu7-drivers-$IPUVER/drivers/media/pci/intel/ipu7/psys/ipu-psys.c"; then
-    pass "the vendor defer check is left intact by a default run"
-  else fail "the defer check was removed without WANT_DEFER_FIX=1"; SC_FAILS=$((SC_FAILS+1)); fi
+    pass "the psys defer check really is neutralised in the vendor tree"
+  else fail "the psys source still has the defer check"; SC_FAILS=$((SC_FAILS+1)); fi
 }
 assert_full_success_rerun(){
   local first_rc; first_rc=$(cat "$SB/rc.first")
