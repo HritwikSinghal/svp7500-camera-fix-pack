@@ -181,12 +181,26 @@ status is the contract:
 | `0` | everything selected actually happened |
 | `1` | the install did not achieve what it set out to — the last screen names what did not happen |
 | `2` | preflight refused, nothing was touched |
-| `0` **with `--no-initramfs`** | everything **except** the initramfs, which you said you would rebuild yourself. The run's last screen is a `BEFORE YOU REBOOT` block naming the exact command you still owe |
 
 So `sudo ./install.sh && sudo reboot` is safe: a failed install will not let you
-reboot into an unchanged system believing it worked. `--no-initramfs` is the one
-opt-out from that, and it is opt-in by definition — pass it and the reboot is
-yours to sequence.
+reboot into an unchanged system believing it worked.
+
+**Three things can make exit `0` mean slightly less than that, and all three are
+opt-in or self-announcing.** They are listed here because "exit 0 means
+everything happened" has to survive being read literally:
+
+| when | what exit `0` means then |
+|---|---|
+| `--no-initramfs` | everything **except** the initramfs, which you said you would rebuild yourself. The run's last screen is a `BEFORE YOU REBOOT` block naming the exact command you still owe |
+| `--mok-enrolled` | everything except *proving* the modules will load. You told the installer you sign them yourself, so it took your word for it and did not check. If you then do not sign them, the kernel refuses every one at boot |
+| `--force` | everything happened, but on a machine that failed the hardware check. This is the one place where exit `0` does not also mean *this was a good idea* — see below |
+
+A phase with nothing to do is not an exception to the contract, and the run says
+so plainly in `steps skipped`: if Howdy is not installed the Howdy phase is
+skipped (there is no `video_capture.py` to hook into), and if you have no
+`ipu7-drivers` DKMS tree the psys patches are skipped (there is no source to
+patch). Neither is a step that failed; both are named on the last screen, with
+the command to finish the job later.
 
 "Actually happened" includes *will actually load*. If your kernel refuses
 unsigned modules — Secure Boot with signature enforcement, which is the factory
@@ -219,6 +233,8 @@ selftest fails if any of this wording drifts from install.sh:
 | `✗ package is missing module '<name>' (no dkms/<name>-*/dkms.conf, no kernel/<name>/dkms.conf) — this clone/tarball is incomplete, re-download it` | **packaging bug — please report it.** This aborts in preflight with exit 2; nothing was touched |
 | `✗ NOTHING WAS INSTALLED. Do not reboot expecting a change — nothing would be different.` | the run achieved nothing and says so. Exit 1 |
 | `✗ the modules will not load on the next boot — this install is on disk but NOT in effect. Do not reboot expecting a working camera.` | Secure Boot / signature enforcement. See below. Exit 1 |
+| `! <module> -> <kernel>: NOT installed — <kernel>'s in-tree intel_skl_int3472_discrete already registers the IR flood LED, and ours does not.` | **expected on kernels ≥ 7.1.** Your kernel is newer than this patch. See [int3472](#2-int3472-patched-dkms) below. Exit status unaffected |
+| `✗ int3472-patched from an earlier run is still shadowing the in-tree driver on <n> kernel(s) — those kernels have no /sys/class/leds/*::ir_flood_led, so Howdy cannot light the illuminator there.` | an older run of this installer broke the illuminator on that kernel. The line above it gives the one `dkms remove` that fixes it. Exit 1 |
 
 The psys section may legitimately say `! no ipu7-drivers package under DKMS ('dkms status' lists none, and /var/lib/dkms has none) — psys patches do not apply to this system`.
 That is **fine and expected** if you do not have Intel's `ipu7-drivers` DKMS
@@ -549,6 +565,21 @@ Issue tracker: [intel/vision-drivers#37](https://github.com/intel/vision-drivers
 ### 2. `int3472-patched` DKMS
 - Adds support for GPIO type `0x02` (IR LED) — needed for HM1092 sensors.
 - Adds an SSDB `controllogicid` fallback walk through the ACPI namespace. Required on USBIO platforms (where the `_DEP` chain is broken and `acpi_dev_get_next_consumer_dev()` returns NULL).
+- **Only installed on kernels that need it, and most modern ones do not.**
+  Mainline gained `skl_int3472_register_led`, so from roughly 7.1 the in-tree
+  `intel_skl_int3472_discrete` already publishes
+  `/sys/class/leds/<sensor>::ir_flood_led`. Ours does not register a
+  `led_classdev` at all — it maps the GPIO to the sensor — and DKMS installs
+  into `updates/`, which `depmod` prefers over `kernel/`. So on such a kernel
+  installing it *removes* the LED node that `udev/99-hm1092-ir-led.rules`
+  chgrps and `howdy/ir_reader.py` writes to: the illuminator then never fires
+  for an unprivileged lock-screen auth, every frame is too dark, and face
+  unlock times out while working perfectly under `sudo`.
+  `install.sh` checks each installed kernel (`tools/int3472-needed.sh` answers
+  the same question on its own) and skips the ones that already have it,
+  saying so. If an earlier run already installed it on such a kernel, the
+  installer now **fails** and gives you the `dkms remove` that restores the
+  in-tree driver.
 
 ### 3. `ipu-bridge-patched` DKMS
 - Adds `HIMX1092` to the `supported_sensors[]` array so the kernel actually enumerates the IR sensor.
@@ -562,6 +593,10 @@ Issue tracker: [intel/vision-drivers#37](https://github.com/intel/vision-drivers
 - RGB sensor driver for boards that pair the SVP7500 bridge with the **OV05C10** (`OVTI05C1`) sensor — e.g. the **Dell Pro Plus 14 PB14250** — instead of the OV08x40 used on the DA16260.
 - The driver is the out-of-tree Intel one from [`intel/ipu6-drivers`](https://github.com/intel/ipu6-drivers) (`drivers/media/i2c/ov05c10.c`); it was never mainlined, so affected boards have no RGB camera until it is installed. The bridge half already enumerates `OVTI05C1` — this supplies the missing sensor driver.
 - Packaged as DKMS so it survives kernel upgrades. Builds clean against 6.18 / 7.0 / 7.1.
+- **Not optional on a board that has that sensor.** If your firmware declares
+  `OVTI05C1`, this is the only RGB driver your machine can use, so `install.sh`
+  treats it as required there: a build failure is exit `1`, not a line in
+  `steps skipped`. On every other board its absence changes nothing.
 
 ### 6. udev rules
 - Disables USB autosuspend on the SVP7500. Bridge firmware has trouble with power state transitions; keeping it always-on prevents some failure modes.

@@ -153,6 +153,13 @@ IPU7_REBUILD_FAIL=0
 STEPS_SKIPPED=0
 RUNNING_NOBUILD=0
 HOWDY_PHASE_DONE=0
+# int3472-patched is a downgrade on kernels whose in-tree driver already
+# publishes the IR flood LED. INT3472_STALE counts kernels where an earlier run
+# of this installer already left ours in place -- those cameras are broken now.
+INT3472_STALE=0
+# Set from the firmware's own sensor list in preflight: on a board that declares
+# OVTI05C1 the "optional" ov05c10 is the only RGB driver there is.
+BOARD_NEEDS_OV05C10=0
 SECUREBOOT="not checked"
 SIGNING_STATE="not checked"
 SIGN_FAIL=0
@@ -161,6 +168,10 @@ declare -a INSTALLED_KOS=()
 declare -a INSTALLED_MODULES=() FAILED_MODULES=() SKIPPED_NOTES=() ACTIONS=()
 declare -a KFAIL_NOTES=() PSYS_SNAPS=() HR_TRIED=() CFG_TRIED=()
 declare -A MOD_KERNELS=() KCOUNT=() KFAIL_KERNELS=()
+# Kernels a module was deliberately NOT installed for, and why -- kept apart
+# from both okkernels and badkernels so the summary can say "not needed here"
+# instead of letting it read as either a success or a build failure.
+declare -A MOD_NOTNEEDED=() KNOTNEEDED=()
 
 skip_step(){ STEPS_SKIPPED=$((STEPS_SKIPPED+1)); SKIPPED_NOTES+=("$1"); warn "$1"; }
 action(){ ACTIONS+=("$1"); }
@@ -385,6 +396,30 @@ else
       fi
       ;;
   esac
+
+  # "Optional" is a property of the PACKAGE, not of the machine. ov05c10 is the
+  # only RGB sensor driver on boards whose firmware declares OVTI05C1 (the Dell
+  # Pro 14 Plus PB14250 -- @dalandro's machine, the one third-party
+  # configuration confirmed on hardware the author does not own). It was never
+  # mainlined, so on those boards there is NO RGB camera without it.
+  #
+  # Treating it as optional there meant it could fail to build for every kernel,
+  # be filed under "steps skipped" with the note "harmless unless your RGB
+  # sensor is OV05C10" -- on a board where it IS the RGB sensor -- and the run
+  # would exit 0 with the camera dead. The board's own firmware already answers
+  # the question the note asks the user to answer.
+  case ${HW_SENSORS:-} in
+    *OVTI05C1*|*ovti05c1*)
+      BOARD_NEEDS_OV05C10=1
+      if [[ $DO_KERNEL -eq 1 ]]; then
+        if [[ -n ${SRC_OF[ov05c10]:-} ]]; then
+          ok "this board's RGB sensor is OVTI05C1, so ov05c10 is REQUIRED here, not optional"
+        else
+          pf_bad "this board declares the OVTI05C1 (OV05C10) RGB sensor and this package has no ov05c10 module (no dkms/ov05c10-*/dkms.conf) — without it this board has no RGB camera driver at all. Re-download the package."
+        fi
+      fi
+      ;;
+  esac
 fi
 
 # --- Secure Boot / module signing -------------------------------------------
@@ -531,6 +566,32 @@ ko_present(){
     [[ -n $hit ]] && { echo "$hit"; return 0; }
   done
   return 1
+}
+
+# Would installing int3472-patched over this kernel's in-tree driver make
+# things WORSE? On kernels whose intel_skl_int3472_discrete already registers
+# the IR flood LED (mainline gained skl_int3472_register_led; verified here on
+# 7.1.1, 7.1.4 and 7.2.0-rc4), ours is not merely redundant: it maps GPIO type
+# 0x02 to a sensor-side "ir-led" con_id and registers NO led_classdev, and DKMS
+# installs it into updates/, which outranks kernel/. So the install silently
+# DELETES /sys/class/leds/<sensor>::ir_flood_led -- the node
+# udev/99-hm1092-ir-led.rules chgrps, howdy/ir_reader.py writes to, and
+# verify.sh checks. The illuminator then never fires for an unprivileged
+# lock-screen auth, every frame is too dark, and face unlock times out while
+# working perfectly under sudo.
+#
+# That was a green "✓ int3472-patched -> <kernel>" and exit 0 on top of a
+# camera this package had just broken. tools/int3472-needed.sh already knew;
+# nothing consulted it. One implementation, called here, so the tool that
+# answers the question and the installer that acts on it cannot disagree.
+#
+# Conservative by construction: it answers "needed" whenever it cannot find an
+# in-tree module to read, so the only way to skip is positive evidence that the
+# kernel already publishes the LED.
+INT3472_CHECK="$HERE/tools/int3472-needed.sh"
+int3472_redundant(){
+  [[ -f $INT3472_CHECK ]] || return 1
+  ! bash "$INT3472_CHECK" "$1" >/dev/null 2>&1
 }
 
 # A module compiled INTO the kernel can never be replaced by a DKMS build. That
@@ -696,7 +757,7 @@ install_module(){
   # Build for EVERY installed kernel. Building only $(uname -r) has repeatedly
   # left other kernels with stale modules and a dead camera after a reboot.
   local names k good=0 badk=0
-  local -a badkernels=() okkernels=()
+  local -a badkernels=() okkernels=() notneeded=()
   mapfile -t names < <(built_module_names "$src")
   [[ ${#names[@]} -gt 0 ]] || names=("$m")
 
@@ -704,6 +765,26 @@ install_module(){
     if [[ $DRY_RUN -eq 1 ]]; then
       plan "would run: dkms install --force ${m}/${ver} -k $k   (then check for ${names[*]} under /lib/modules/$k/{updates,extra})"
       good=$((good+1)); okkernels+=("$k"); KBUILD_OK=$((KBUILD_OK+1))
+      continue
+    fi
+
+    # Would ours be a downgrade on this kernel? See int3472_redundant above.
+    # Not a build failure -- nothing failed -- but it must be visible, and a
+    # copy left behind by an EARLIER run is a camera that is broken right now.
+    if [[ $m == int3472-patched ]] && int3472_redundant "$k"; then
+      notneeded+=("$k")
+      MOD_NOTNEEDED[$m]="${MOD_NOTNEEDED[$m]:+${MOD_NOTNEEDED[$m]} }$k"
+      KNOTNEEDED[$k]=$(( ${KNOTNEEDED[$k]:-0} + 1 ))
+      warn "$m -> $k: NOT installed — $k's in-tree intel_skl_int3472_discrete already registers the IR flood LED, and ours does not. Installing it here would REMOVE /sys/class/leds/*::ir_flood_led and stop the illuminator firing for Howdy"
+      local -a leftover=()
+      for n in "${names[@]}"; do
+        ko_present "$k" "$n" >/dev/null && leftover+=("$n")
+      done
+      if [[ ${#leftover[@]} -gt 0 && $DRY_RUN -eq 0 ]]; then
+        INT3472_STALE=$((INT3472_STALE+1))
+        bad "$m -> $k: an EARLIER run of this installer already put ${leftover[*]} in /lib/modules/$k/updates — that kernel has NO IR flood LED node right now, so Howdy cannot light the illuminator on it"
+        action "remove the shadowing copy on $k: sudo dkms remove int3472-patched/$ver -k $k   (this restores $k's in-tree driver and the ir_flood LED)"
+      fi
       continue
     fi
 
@@ -770,6 +851,14 @@ install_module(){
   done
   [[ ${#okkernels[@]} -gt 0 ]] && MOD_KERNELS[$m]="${okkernels[*]}"
 
+  # Deliberately not installed anywhere is not a failed install -- but it is
+  # also not an install, so it may not be counted as one. Say the true thing
+  # and move on: MOD_OK stays where it is, and the summary lists the kernels.
+  if [[ $good -eq 0 && $badk -eq 0 && ${#notneeded[@]} -gt 0 ]]; then
+    skip_step "$m was not installed for any kernel: every one of them (${notneeded[*]}) already provides it in-tree, and this package's copy would be a downgrade"
+    return 0
+  fi
+
   if [[ $good -gt 0 ]]; then
     MOD_OK=$((MOD_OK+1)); INSTALLED_MODULES+=("$m")
     # Written as a full if, not `[[ ]] && warn`: a trailing test that is false
@@ -817,7 +906,14 @@ install_module(){
 
 for m in "${REQUIRED_MODULES[@]}"; do install_module "$m" required; done
 for m in "${OPTIONAL_MODULES[@]}"; do
-  [[ -n ${SRC_OF[$m]:-} ]] && install_module "$m" optional
+  [[ -n ${SRC_OF[$m]:-} ]] || continue
+  # Required when this board's firmware says it is the RGB sensor. See the
+  # OVTI05C1 block in preflight.
+  if [[ $m == ov05c10 && $BOARD_NEEDS_OV05C10 -eq 1 ]]; then
+    install_module "$m" required
+  else
+    install_module "$m" optional
+  fi
 done
 fi
 
@@ -1405,8 +1501,15 @@ if [[ $DO_KERNEL -eq 1 ]]; then
     [[ -n ${SRC_OF[$m]:-} ]] || continue
     if [[ -n ${MOD_KERNELS[$m]:-} ]]; then
       printf '        %-22s %s%s\n' "$m" "$FOR_K" "${MOD_KERNELS[$m]}"
+    elif [[ -n ${MOD_NOTNEEDED[$m]:-} ]]; then
+      printf '        %-22s %s\n' "$m" "not needed on: ${MOD_NOTNEEDED[$m]}"
     else
       printf '        %-22s %s\n' "$m" "NOT INSTALLED for any kernel"
+    fi
+    # A "not needed" kernel is a deliberate omission, not a gap. Print the
+    # reason next to it, or the per-kernel fraction below reads as a shortfall.
+    if [[ -n ${MOD_KERNELS[$m]:-} && -n ${MOD_NOTNEEDED[$m]:-} ]]; then
+      printf '        %-22s %s\n' "" "(not needed on: ${MOD_NOTNEEDED[$m]})"
     fi
   done
   if [[ ${#KERNELS[@]} -gt 0 ]]; then
@@ -1414,7 +1517,12 @@ if [[ $DO_KERNEL -eq 1 ]]; then
     for k in "${KERNELS[@]}"; do
       note=""
       [[ $k == "$RUNNING" ]] && note="   <- the kernel you are running now"
-      printf '        %-22s %d of %d module(s)%s\n' "$k" "${KCOUNT[$k]:-0}" "$TARGETS" "$note"
+      # The denominator drops by whatever this kernel does not need, so
+      # "3 of 4" never appears for a kernel that got everything it should.
+      kt=$(( TARGETS - ${KNOTNEEDED[$k]:-0} ))
+      kn=""
+      [[ ${KNOTNEEDED[$k]:-0} -gt 0 ]] && kn="   (+${KNOTNEEDED[$k]} not needed on this kernel)"
+      printf '        %-22s %d of %d module(s)%s%s\n' "$k" "${KCOUNT[$k]:-0}" "$kt" "$kn" "$note"
     done
   fi
   if [[ ${#NOBUILD[@]} -gt 0 ]]; then
@@ -1487,6 +1595,15 @@ if [[ $DO_KERNEL -eq 1 ]]; then
   elif [[ ${KCOUNT[$RUNNING]:-0} -eq 0 && ${#KERNELS[@]} -gt 0 && $MOD_OK -gt 0 ]]; then
     bad "no module was installed for the kernel you are running ($RUNNING) — rebooting into it changes nothing."
     action "see the per-kernel list above: $RUNNING got nothing; fix its build errors or boot a kernel that did get the modules"
+    RC=1
+  fi
+  # A module this package installed on an earlier run, which this run has just
+  # proved makes that kernel WORSE, is a broken camera sitting on the disk right
+  # now. Everything else can be green and this still has to fail: the user would
+  # otherwise reboot into a kernel with no IR flood LED, on an exit 0, with the
+  # one command that fixes it buried in the middle of a success screen.
+  if [[ $INT3472_STALE -gt 0 ]]; then
+    bad "int3472-patched from an earlier run is still shadowing the in-tree driver on ${INT3472_STALE} kernel(s) — those kernels have no /sys/class/leds/*::ir_flood_led, so Howdy cannot light the illuminator there. See the 'dkms remove' command above."
     RC=1
   fi
   # A patch that did not apply is also something that did not happen, and it

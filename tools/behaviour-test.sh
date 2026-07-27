@@ -110,6 +110,9 @@ declare -a SCENARIOS=(
   no-initramfs-flag
   dry-run-changes-nothing
   dry-run-predicts-signing-failure
+  int3472-redundant-on-this-kernel
+  int3472-shadow-from-an-earlier-run
+  ov05c10-required-by-this-board
   full-success
   full-success-rerun
   full-success-from-another-cwd
@@ -140,6 +143,9 @@ declare -A RULE=(
   [no-initramfs-flag]="the one documented way to exit 0 without a fresh initramfs, said out loud"
   [dry-run-changes-nothing]="exit 0 and not one byte written anywhere"
   [dry-run-predicts-signing-failure]="a rehearsal must predict the refusal, not discover it after the reboot"
+  [int3472-redundant-on-this-kernel]="the kernel already publishes the IR flood LED: do not install ours over it, and say so"
+  [int3472-shadow-from-an-earlier-run]="ours is already shadowing that kernel's driver: the illuminator is dead NOW, so exit 1"
+  [ov05c10-required-by-this-board]="the firmware declares OVTI05C1: ov05c10 is not optional here, and failing it is exit 1"
   [full-success]="everything selected happened: exit 0 (a harness that only proves failure proves nothing)"
   [full-success-rerun]="run twice: second run exits 0 and says what it did NOT redo"
   [full-success-from-another-cwd]="invoked by absolute path and through a symlink, from /"
@@ -877,6 +883,41 @@ world_dry_run_predicts_signing_failure(){
   setargs --dry-run
   setenv BT_SB_STATE enabled; enforce_sig
 }
+# --- int3472 / ov05c10 : "optional" and "needed" are properties of the BOARD --
+# Give the fake kernels an in-tree intel_skl_int3472_discrete that already
+# registers the IR flood LED, plus the two readers tools/int3472-needed.sh uses
+# to look inside a module. Nothing else in the world changes.
+int3472_in_tree_has_ir_flood(){ # $1 = sandbox, rest = kernels
+  local sb=$1; shift
+  local k d
+  for k in "$@"; do
+    d="$sb/root/lib-modules/$k/kernel/drivers/platform/x86/intel/int3472"
+    mkdir -p "$d"
+    printf 'ELF stand-in\nir_flood\nskl_int3472_register_led\n' >"$d/intel_skl_int3472_discrete.ko"
+  done
+  # `strings` on a text file is `cat`; the real one is not in SYSBIN on purpose,
+  # so this stays a state the scenario creates rather than one it inherits.
+  printf '#!/bin/bash\ncat "$@"\n' >"$sb/shims/strings"
+  chmod 0755 "$sb/shims/strings"
+}
+world_int3472_redundant_on_this_kernel(){
+  int3472_in_tree_has_ir_flood "$SB" "$KA" "$KB"
+}
+world_int3472_shadow_from_an_earlier_run(){
+  int3472_in_tree_has_ir_flood "$SB" "$KA" "$KB"
+  # An earlier run of THIS installer already put ours in updates/ on the kernel
+  # the user is running. That camera has no ir_flood LED right now.
+  mkdir -p "$SB/root/lib-modules/$KA/updates/dkms"
+  echo "shadowing copy from an earlier run" \
+    >"$SB/root/lib-modules/$KA/updates/dkms/intel_skl_int3472_discrete.ko"
+}
+world_ov05c10_required_by_this_board(){
+  # A PB14250-class board: the firmware declares OVTI05C1 instead of the
+  # OV08F4, so ov05c10 is the ONLY RGB sensor driver this machine can use.
+  mkdir -p "$SB/root/sys/bus/acpi/devices/OVTI05C1:00"
+  setenv BT_DKMS_FAIL_MODULES "ov05c10"
+}
+
 world_full_success(){ :; }
 world_full_success_rerun(){ setenv BT_RUN_TWICE 1; }
 world_full_success_from_another_cwd(){
@@ -1163,6 +1204,48 @@ assert_full_success_rerun(){
   expect_say 'video_capture.py already has the ir plugin' "that Howdy was already hooked"
   expect_say 'moved aside to /usr/src/.*\.bak' "where the previous tree went"
   expect_silent '✗' "any failure line"
+}
+assert_int3472_redundant_on_this_kernel(){
+  # Nothing failed, so the run succeeds -- but it must not claim to have
+  # installed a module it deliberately did not install.
+  expect_rc 0
+  expect_say 'NOT installed' "that int3472-patched was not installed"
+  expect_say 'REMOVE /sys/class/leds' "what installing it would have cost"
+  expect_say 'not needed on:' "the kernels it was skipped for, in the summary"
+  # The claim has to be true on disk, not merely printed: nothing named int3472
+  # may have landed in an out-of-tree location, where depmod would prefer it
+  # over the kernel's own copy. (kernel/ still holds the in-tree module this
+  # scenario created -- that is the thing we are protecting.)
+  # Match the FILE name, not the path: the sandbox directory is itself called
+  # int3472-redundant-on-this-kernel, and grepping the path made every module
+  # in the tree look like an int3472 module.
+  local shadow d
+  shadow=""
+  for d in updates extra weak-updates; do
+    shadow+=$(find "$SB/root/lib-modules" -type d -name "$d" \
+              -exec find {} -name '*int3472*' \; 2>/dev/null)
+  done
+  if [[ -z $shadow ]]; then
+    pass "and no int3472 module landed in updates/ or extra/ — the in-tree driver still wins"
+  else
+    fail "it said it did not install int3472-patched, and this landed anyway: $shadow"
+    SC_FAILS=$((SC_FAILS+1))
+  fi
+}
+assert_int3472_shadow_from_an_earlier_run(){
+  # Everything else is green and the camera is still broken on that kernel.
+  expect_rc 1
+  expect_say 'an EARLIER run of this installer already put' "that ours is already shadowing the in-tree driver"
+  expect_say 'dkms remove int3472-patched' "the one command that fixes it"
+  expect_silent '==> Done' "Done on a run that leaves the illuminator dead"
+}
+assert_ov05c10_required_by_this_board(){
+  expect_rc 1
+  expect_say 'ov05c10 is REQUIRED here, not optional' "that the board's firmware decides this"
+  expect_say 'required module\(s\) did not install' "ov05c10 counted as a failure, not a skip"
+  expect_silent 'harmless unless your RGB sensor is OV05C10' \
+    "the note that calls a dead RGB camera harmless"
+  expect_silent '==> Done' "Done on a board left with no RGB driver"
 }
 assert_full_success_from_another_cwd(){
   expect_rc 0
