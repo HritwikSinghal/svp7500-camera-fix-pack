@@ -22,11 +22,14 @@
 #   ./tools/selftest.sh          human output
 #   ./tools/selftest.sh -q       only failures and the summary
 #   ./tools/selftest.sh --prove  test the test: build one correct throwaway
-#                                package and nine broken ones -- each carrying a
-#                                bug that shipped or nearly did -- and assert
-#                                this script accepts the first and rejects every
-#                                other. A check nobody has ever seen fail is not
-#                                yet a check.
+#                                package and a dozen broken ones -- each
+#                                carrying a bug that shipped or nearly did --
+#                                and assert this script accepts the first and
+#                                rejects every other. A check nobody has ever
+#                                seen fail is not yet a check. The correct
+#                                package is not a formality: it is the only
+#                                thing standing between a strict check and a
+#                                false accusation against working code.
 #
 # Exit status: 0 = every check passed, 1 = at least one FAIL.
 # WARN never changes the exit status, so it is reserved for things that are
@@ -76,6 +79,14 @@ rel(){ printf '%s' "${1#"$ROOT"/}"; }
 # `return 0`) is an assert-EACH loop, like preflight's "package is missing $f"
 # check: every path in it is independently required.
 #
+# A loop over ONE word is neither: there is nothing to fall back to, so the
+# single path has to work no matter what break or return it contains. Tagging
+# it CAND exempted it from the "must resolve for every module" rule, and that
+# is precisely the shape of the bug that shipped --
+#     for d in "$HERE/kernel/$m"; do ... return 0; done
+# -- so the word list is counted first and only a list of two or more is
+# eligible to be a candidate list.
+#
 # The distinction matters because the reference checker used to group by
 # basename and pass a group when any member existed. That is correct for a real
 # candidate list and wrong for everything else: it is how `git rm verify.sh`
@@ -90,7 +101,11 @@ logical_lines(){
       for (i=1;i<=n;i++) {
         tag="PLAIN"
         if (L[i] ~ /(^|[;&|{}][[:space:]]*|[[:space:]])for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]].*;[[:space:]]*do([[:space:]]|$)/) {
-          for (j=i;j<=n;j++) {
+          lst=L[i]
+          sub(/^.*[[:space:]]in[[:space:]]+/,"",lst)
+          sub(/;[[:space:]]*do([[:space:]].*)?$/,"",lst)
+          nw=split(lst,W,/[[:space:]]+/)
+          for (j=i;(nw>1)&&(j<=n);j++) {
             if (j>i && L[j] ~ /^[[:space:]]*done([[:space:]]|;|$)/) break
             if (L[j] ~ /(^|[^A-Za-z0-9_])break([^A-Za-z0-9_]|$)/ ||
                 L[j] ~ /(^|[^A-Za-z0-9_])return[[:space:]]+0([^0-9]|$)/) { tag="CAND"; break }
@@ -141,19 +156,58 @@ EOF
     printf 'ACTION=="add", KERNEL=="flash*", MODE="0660"\n' > "$1/udev/99-hm1092-ir-led.rules"
     printf 'class ir_reader:\n    pass\n' > "$1/howdy/ir_reader.py"
     printf -- '--- a/video_capture.py\n+++ b/video_capture.py\n' > "$1/howdy/video_capture.patch"
-    printf '#!/bin/bash\necho "verification, canonical copy"\n' > "$1/tools/verify.sh"
+    # The shared-library shape, in the CORRECT package on purpose: detection
+    # lives in one file and the consumer sources it. If this script cannot
+    # follow `source`, it reports these LD_* reads as unset-variable bugs --
+    # a red CI on correct code, which is how the library gets abandoned and
+    # the duplicated detection drifts apart again. The two libraries source
+    # each other, so a missing cycle guard hangs instead of finishing.
+    #
+    # $LIBD, not a literal, so this file does not appear to REFERENCE the
+    # throwaway libraries it writes -- the path checker reads this script too,
+    # and would demand the package ship them.
+    local LIBD=tools
+    cat > "$1/$LIBD/verify.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=\$(cd "\$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)
+. "\$ROOT/$LIBD/lib-demo.sh"
+echo "verification, canonical copy: \$LD_DEMO \$LD_DEEP"
+EOF
+    cat > "$1/$LIBD/lib-demo.sh" <<EOF
+#!/usr/bin/env bash
+[[ -n \${LIB_DEMO_LOADED:-} ]] && return 0
+LIB_DEMO_LOADED=1
+LIB_ROOT=\$(cd "\$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)
+. "\$LIB_ROOT/$LIBD/lib-deep.sh"
+LD_DEMO=demo
+EOF
+    cat > "$1/$LIBD/lib-deep.sh" <<EOF
+#!/usr/bin/env bash
+[[ -n \${LIB_DEEP_LOADED:-} ]] && return 0
+LIB_DEEP_LOADED=1
+DEEP_ROOT=\$(cd "\$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)
+. "\$DEEP_ROOT/$LIBD/lib-demo.sh"
+LD_DEEP=deep
+EOF
     ln -s tools/verify.sh "$1/verify.sh"
-    chmod +x "$1/install.sh" "$1/tools/verify.sh"
+    chmod +x "$1/install.sh" "$1/$LIBD/verify.sh" "$1/$LIBD/lib-demo.sh" "$1/$LIBD/lib-deep.sh"
     cp "${BASH_SOURCE[0]}" "$1/tools/selftest.sh"; chmod +x "$1/tools/selftest.sh"
   }
   GOOD_SEARCH='"$HERE"/dkms/"$m"-*/ "$HERE/dkms/$m" "$HERE/kernel/$m"'
   rc=0
   # mutate <name> -- a copy of the good package for the caller to break
   mutate(){ cp -a "$t/good" "$t/$1"; printf '%s' "$t/$1"; }
+  # Every fixture runs under a time limit. Following `source` between package
+  # files can cycle, and a check that hangs is worse than one that fails: CI
+  # goes yellow for twenty minutes and the next person disables it. A timeout
+  # here turns that regression into an ordinary FAIL with a name.
+  TMO=(); command -v timeout >/dev/null 2>&1 && TMO=(timeout 120)
   # expect_fail <dir> <substring> <what it is>
   expect_fail(){
     local d=$1 want=$2 label=$3 out e
-    out=$(NO_COLOR=1 "$d/tools/selftest.sh" 2>&1); e=$?
+    out=$(NO_COLOR=1 "${TMO[@]}" "$d/tools/selftest.sh" 2>&1); e=$?
+    [[ $e -eq 124 ]] && { printf '  FAIL  %s TIMED OUT — the checker hangs on it (a cycle it does not guard?)\n' "$(basename "$d")"; rc=1; return; }
     if [[ $e -ne 0 ]] && grep -qF "$want" <<<"$out"; then
       printf '  PASS  rejects %s\n' "$label"
     elif [[ $e -eq 0 ]]; then
@@ -164,9 +218,11 @@ EOF
   }
 
   mk_pkg "$t/good" "$GOOD_SEARCH"
-  out_g=$(NO_COLOR=1 "$t/good/tools/selftest.sh" 2>&1); eg=$?
-  if [[ $eg -eq 0 ]]; then
-    printf '  PASS  accepts a correctly laid out package\n'
+  out_g=$(NO_COLOR=1 "${TMO[@]}" "$t/good/tools/selftest.sh" 2>&1); eg=$?
+  if [[ $eg -eq 124 ]]; then
+    printf '  FAIL  the CORRECT package TIMED OUT — the checker hangs (an unguarded source cycle?)\n'; rc=1
+  elif [[ $eg -eq 0 ]]; then
+    printf '  PASS  accepts a correctly laid out package (including a script that sources a library that sources it back)\n'
   else
     printf '  FAIL  rejects a CORRECT package — false positive, every proof below is meaningless\n'
     printf '%s\n' "$out_g" | sed -n 's/^  FAIL/        FAIL/p'; rc=1
@@ -234,6 +290,33 @@ EOF
   expect_fail "$d" "installer output that install.sh never prints" \
     "a README decode table quoting a message the installer does not print"
 
+  # 9. The shipped bug again, reintroduced the way a careful revert would do it:
+  #    ONLY the lookup goes back to kernel/<name>/, while a diagnostic counter
+  #    elsewhere still globs dkms/<name>-*/. This passed. Two things let it: a
+  #    one-path `for ... in X; do ... return 0; done` was read as a candidate
+  #    list and exempted, and the per-module check accepted ANY resolving path
+  #    in the file -- so the counter answered for the resolver while the
+  #    resolver found nothing and install.sh aborted with "this does not look
+  #    like the fix-pack directory" at the user's end. Two paths in the dead
+  #    list, so the loop is a genuine candidate list and only reading the
+  #    resolver's own body can catch it.
+  mk_pkg "$t/dead-lookup-live-counter" '"$HERE/kernel/$m" "$HERE/kernel/$m-src"'
+  printf 'count_src(){ local m=$1 d n=0; for d in "$HERE"/dkms/"$m"-*/; do [[ -d $d ]] && n=$((n+1)); done; printf "%%s" "$n"; }\n' \
+    >> "$t/dead-lookup-live-counter/install.sh"
+  expect_fail "$t/dead-lookup-live-counter" "CANNOT FIND module 'demo'" \
+    "a dead module lookup vouched for by a diagnostic glob that still resolves"
+
+  # 10. The other direction of the same class: a script that reads a variable
+  #     nothing ever assigns. tools/find-ir-node.sh shipped this -- an
+  #     `awk -v s="$SD_ENT"` typo killed the subshell under set -u, the script
+  #     fell back to a hardcoded CSI-2 port and printed "(auto-detected)" beside
+  #     the wrong answer. Teaching the checker to follow `source` must not cost
+  #     it this: here the source line is removed and the LD_* reads stay.
+  d=$(mutate lib-not-sourced)
+  sed -i '/lib-demo/d' "$d/tools/verify.sh"
+  expect_fail "$d" "reads unset variable(s)" \
+    "a script that reads a library's variables without sourcing the library"
+
   exit $rc
 fi
 
@@ -269,6 +352,67 @@ mapfile -t MOD_PATTERNS < <(grep -oE "$MOD_PAT_RE" "$INSTALL" | tr -d '"' | sort
 mapfile -t MOD_PAT_PLAIN < <(logical_lines "$INSTALL" | grep '^PLAIN' \
                              | grep -oE "$MOD_PAT_RE" | tr -d '"' | sort -u)
 
+# ---------------------------------------------------------------------------
+# ...and, separately, the paths the LOOKUP itself uses.
+#
+# Checking "some $HERE/...$m... path in install.sh resolves" is not the same
+# question as "the installer can find the module", and the difference is not
+# academic: revert only find_src's body to the old kernel/<name>/ form and the
+# per-module check still passed, because count_src's dkms/<name>-*/ glob -- a
+# diagnostic counter that nothing installs from -- resolved and vouched for a
+# resolver that no longer used it. A counter must never be able to answer for
+# the resolver, so the resolver's own body is read on its own.
+#
+# The resolver is identified by its CALL SITE, not by its name: the function
+# whose success or failure decides whether a module was found --
+#     if s=$(find_src "$m"); then ...        find_src "$m" || skip
+# -- so renaming it, or replacing it, keeps this honest. `$(count_src "$m")`
+# used inside a test is not such a call and is not picked up.
+fn_names(){ grep -oE '^[[:space:]]*(function[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)' "$1" \
+            | sed -E 's/^[[:space:]]*(function[[:space:]]+)?//; s/[[:space:]]*\(\)$//' | sort -u; }
+fn_body(){ # <script> <fn> -> that function's body (handles one-line definitions)
+  awk -v fn="$2" '
+    !inb {
+      if ($0 ~ "^[[:space:]]*(function[[:space:]]+)?" fn "[[:space:]]*\\(\\)[[:space:]]*\\{") {
+        inb=1; rest=$0; sub(/^[^{]*\{/,"",rest); print rest
+        if (rest ~ /\}[[:space:]]*$/) inb=0
+      }
+      next }
+    /^[[:space:]]*\}[[:space:]]*$/ { inb=0; next }
+    { print }' "$1"
+}
+RESOLVER_FNS=(); while read -r fn; do
+  [[ -n $fn ]] || continue
+  grep -qE "(^|[^A-Za-z0-9_])(if[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=)?[\$]?[(]?${fn}[[:space:]]+\"?[\$]\{?m\}?\"?[)]?[[:space:]]*([;][[:space:]]*then|[|][|]|&&|$)" \
+       "$INSTALL" && RESOLVER_FNS+=("$fn")
+done < <(fn_names "$INSTALL")
+fn_strip(){ # <script> <fn>... -> the script with those function bodies blanked out
+  local s=$1; shift
+  awk -v fns=" $* " '
+    !inb {
+      if ($0 ~ /^[[:space:]]*(function[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)[[:space:]]*\{/) {
+        nm=$0; sub(/^[[:space:]]*(function[[:space:]]+)?/,"",nm); sub(/[[:space:]]*\(\).*$/,"",nm)
+        if (index(fns," " nm " ")>0) {
+          rest=$0; sub(/^[^{]*\{/,"",rest); inb=(rest ~ /\}[[:space:]]*$/)?0:1; print ""; next }
+      }
+      print; next }
+    /^[[:space:]]*\}[[:space:]]*$/ { inb=0; print ""; next }
+    { print "" }' "$s"
+}
+LOOKUP_PATTERNS=(); MOD_PAT_PLAIN_OUT=("${MOD_PAT_PLAIN[@]:-}")
+if [[ ${#RESOLVER_FNS[@]} -gt 0 ]]; then
+  mapfile -t LOOKUP_PATTERNS < <(for fn in "${RESOLVER_FNS[@]}"; do fn_body "$INSTALL" "$fn"; done \
+                                 | grep -oE "$MOD_PAT_RE" | tr -d '"' | sort -u)
+  # The same harvest with the lookup's own body removed. Inside a lookup that
+  # demonstrably finds every module, a tier that matches nothing is a fallback
+  # doing its job -- the published package ships dkms/<name>-<ver>/, so the
+  # kernel/<name>/ tier resolves for nothing and must not be reported. Outside
+  # it, every one of these paths is used directly. When the lookup is BROKEN
+  # nothing about it is exempt: its dead paths are then the whole story.
+  mapfile -t MOD_PAT_PLAIN_OUT < <(logical_lines <(fn_strip "$INSTALL" "${RESOLVER_FNS[@]}") \
+                                   | grep '^PLAIN' | grep -oE "$MOD_PAT_RE" | tr -d '"' | sort -u)
+fi
+
 mod_expand(){ local e=${1//\$HERE/$ROOT}; e=${e//\$\{m\}/$2}; printf '%s' "${e//\$m/$2}"; }
 mod_hit(){ # <pattern> <module> -> prints the source dir it resolves to, or fails
   local e d; e=$(mod_expand "$1" "$2")
@@ -286,10 +430,29 @@ elif [[ ${#MOD_PATTERNS[@]} -eq 0 ]]; then
   fail "install.sh contains no \$HERE/...\$m path — cannot tell where it looks for modules" \
        "if it looks in the wrong place every module is skipped and the run still exits 0"
 else
-  info "installer searches: ${MOD_PATTERNS[*]}"
+  # Ask the resolver's own paths when they can be read. Falling back to every
+  # $HERE/...$m... path in the file is the weaker question -- it is the one that
+  # let a dead lookup pass -- so say so out loud rather than answering it
+  # silently.
+  if [[ ${#LOOKUP_PATTERNS[@]} -gt 0 ]]; then
+    SEARCH_PATS=("${LOOKUP_PATTERNS[@]}")
+    info "module lookup ${RESOLVER_FNS[*]}() searches: ${SEARCH_PATS[*]}"
+  else
+    SEARCH_PATS=("${MOD_PATTERNS[@]}")
+    if [[ ${#RESOLVER_FNS[@]} -eq 0 ]]; then
+      warn "cannot tell which function install.sh uses to locate a module" \
+           "expected a call whose success decides it: 'if s=\$(fn \"\$m\"); then' or 'fn \"\$m\" || skip'" \
+           "checking every \$HERE/...\$m path in the file instead — weaker: a diagnostic glob can vouch for a broken lookup"
+    else
+      warn "install.sh's module lookup ${RESOLVER_FNS[*]}() builds no \$HERE/...\$m path this check can read" \
+           "checking every \$HERE/...\$m path in the file instead — weaker: a diagnostic glob can vouch for a broken lookup"
+    fi
+    info "installer searches: ${SEARCH_PATS[*]}"
+  fi
+  LOOKUP_BROKEN=0
   for m in "${ALL_M[@]}"; do
     found=""; tried=()
-    for pat in "${MOD_PATTERNS[@]}"; do
+    for pat in "${SEARCH_PATS[@]}"; do
       tried+=("$(rel "$(mod_expand "$pat" "$m")")")
       found=$(mod_hit "$pat" "$m") && break
       found=""
@@ -302,6 +465,7 @@ else
       warn "optional module '$m' is named by install.sh but not shipped at all" \
            "boards that need it get nothing; install.sh will skip it by design"
     else
+      LOOKUP_BROKEN=1
       shipped=$(cd "$ROOT" && ls -d dkms/"$m"* kernel/"$m"* 2>/dev/null | tr '\n' ' ')
       fail "install.sh CANNOT FIND module '$m' — it would skip it and still report success" \
            "searched: ${tried[*]}" \
@@ -315,7 +479,9 @@ else
   # fallback is for -- but a path built anywhere else (the copy step, a backup,
   # a dkms add) is used directly, and one wrong layout assumption there skips
   # the module exactly the way the shipped bug did, one function later.
-  for pat in "${MOD_PAT_PLAIN[@]:-}"; do
+  PLAIN_PATS=("${MOD_PAT_PLAIN_OUT[@]:-}")
+  [[ $LOOKUP_BROKEN -eq 1 ]] && PLAIN_PATS=("${MOD_PAT_PLAIN[@]:-}")
+  for pat in "${PLAIN_PATS[@]:-}"; do
     [[ -z $pat ]] && continue
     misses=(); for m in "${ALL_M[@]}"; do mod_hit "$pat" "$m" >/dev/null || misses+=("$m"); done
     if [[ ${#misses[@]} -eq ${#ALL_M[@]} ]]; then
@@ -674,7 +840,7 @@ section "no script dies on an unset variable"
 # an `awk -v s="$SD_ENT"` typo killed the subshell, the script fell back to a
 # hardcoded CSI-2 port, and printed "(auto-detected)" next to the wrong answer.
 #
-# shellcheck cannot cover this: SC2154 deliberately ignores ALL-CAPS names,
+# ShellCheck cannot cover this: SC2154 deliberately ignores ALL-CAPS names,
 # assuming they come from the environment, and these are all ALL-CAPS.
 AWK_BUILTINS=' NF NR FS OFS ORS RS FILENAME FNR SUBSEP RSTART RLENGTH CONVFMT OFMT ENVIRON '
 SHELL_ENV=' HOME PATH USER LOGNAME EUID UID PWD OLDPWD IFS SHELL TERM LANG LC_ALL HOSTNAME
@@ -687,11 +853,41 @@ SHELL_ENV=' HOME PATH USER LOGNAME EUID UID PWD OLDPWD IFS SHELL TERM LANG LC_AL
 # every LD_* name from tools/lib-detect.sh this way, and install.sh gets the
 # HW_* names from tools/check-hardware.sh. Without this the check would demand
 # that a library's callers redeclare its interface -- a false failure, which is
-# how a useful check gets deleted.
-sourced_files(){
-  grep -oE '(^|[[:space:]])(\.|source)[[:space:]]+"?\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/[A-Za-z0-9_./-]+' "$1" \
-    | sed -E 's@.*\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/@@' \
-    | while read -r p; do [[ -f $ROOT/$p ]] && printf '%s\n' "$ROOT/$p"; done
+# how a useful check gets deleted: a red CI on a correct refactor gets the check
+# weakened or the shared library abandoned, and then the duplicated detection
+# logic drifts apart again.
+#
+# Sourcing is followed TRANSITIVELY -- a library may itself source another --
+# and only for files that resolve inside this package: `. /etc/os-release` says
+# nothing this check may rely on. A seen-set makes a cycle (two libraries that
+# source each other, or a library that sources its caller) terminate instead of
+# hanging, which is the failure mode that would otherwise take out CI.
+source_refs(){ # <script> -> package files it sources DIRECTLY, resolved
+  local sd; sd=$(dirname "$1")
+  sed 's/^[[:space:]]*#.*//' "$1" \
+    | grep -oE '(^|[[:space:]]|;)(\.|source)[[:space:]]+[^[:space:];&|<>)]+' \
+    | sed -E 's/^[[:space:]]*;?[[:space:]]*(\.|source)[[:space:]]+//' \
+    | tr -d '"'"'"'' \
+    | while read -r p; do
+        [[ -n $p ]] || continue
+        # strip a leading $VAR/ or $(dirname "$0")/ so the tail is package-relative
+        p=$(printf '%s' "$p" | sed -E 's@^\$\([^)]*\)/@@; s@^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/@@; s@^\./@@')
+        local c
+        for c in "$ROOT/$p" "$sd/$p"; do
+          [[ -f $c ]] && { readlink -f "$c"; break; }
+        done
+      done
+}
+sourced_files(){ # <script> -> every package file it sources, transitively
+  local -A seen=(); local -a queue=(); local cur p
+  seen[$(readlink -f "$1")]=1; queue=("$1")
+  while [[ ${#queue[@]} -gt 0 ]]; do
+    cur=${queue[0]}; queue=("${queue[@]:1}")
+    while read -r p; do
+      [[ -n $p && -z ${seen[$p]:-} ]] || continue   # already followed: cycle guard
+      seen[$p]=1; printf '%s\n' "$p"; queue+=("$p")
+    done < <(source_refs "$cur")
+  done
 }
 
 CODE=$(mktemp); CODEA=$(mktemp); trap 'rm -f "$CODE" "$CODEA"' EXIT
