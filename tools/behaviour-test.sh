@@ -48,6 +48,42 @@
 #   nothing, and a scenario where dkms lies (exit 0, no .ko) would be
 #   indistinguishable from success.
 #
+# ONE VERDICT PER SCENARIO — WHY SOME WORLDS ARE DELIBERATELY IMPOVERISHED
+#
+#   install.sh ends in a block of independent verdicts, each of which can set
+#   RC=1 on its own. A scenario only tests the verdict it is named after if that
+#   verdict is the ONLY one that can fire in its world. Otherwise the scenario
+#   goes red for a neighbour's reason and the check it is named after can be
+#   deleted with the whole suite green.
+#
+#   That was not a worry, it was measured: `RC=1` could be removed from the
+#   per-kernel-build verdict AND from the zero-modules verdict -- the two most
+#   directly descended from the bug this package shipped -- and selftest,
+#   behaviour-test and CI all stayed green, because IPU7_REBUILD_FAIL fired
+#   independently in both of those scenarios' worlds.
+#
+#   So the failure worlds below strip the ipu7-drivers DKMS tree (see
+#   `no_ipu7_dkms_tree`), which is also the common case for a fix-pack user:
+#   a machine that never installed intel-ipu7-dkms-git has nothing for the psys
+#   phase to patch or rebuild. Each such scenario then ALSO asserts that its
+#   neighbours' counters are zero -- "per-kernel builds : 0 ok, 0 failed" in the
+#   zero-modules scenario, "ipu7-drivers : FAILED" absent, and so on. Those
+#   assertions are the isolation, checked by the suite itself rather than
+#   promised in a comment.
+#
+#   Measured after the fact, by deleting each `RC=1` in install.sh's verdict
+#   block one at a time and requiring the scenario that owns it to go red:
+#   twelve of the thirteen now do. The thirteenth is "no module was installed
+#   for the kernel you are running", and it cannot be isolated by any world --
+#   a kernel that got nothing while another kernel got everything IS a
+#   per-kernel build failure, arithmetically, so KBUILD_FAIL is always set
+#   alongside it. running-kernel-gets-no-modules therefore tests that sentence
+#   and those counts, not that verdict's exit status; the table says so.
+#   (Verdicts that share an if/elif -- zero-modules with "required module(s)
+#   did not install", and --howdy-only's with the Howdy-failure verdict -- do
+#   NOT mask each other: deleting one branch's RC=1 does not fall through to
+#   the other, so each is separately testable and separately tested.)
+#
 #   Two interlocks refuse to run rather than risk the host: the inner half exits
 #   non-zero unless it is genuinely in a mount namespace of its own AND every
 #   expected bind mount is present in /proc/self/mountinfo. If the sandbox
@@ -96,12 +132,16 @@ declare -a SCENARIOS=(
   mkinitcpio-fails
   dkms-all-builds-fail
   dkms-fails-for-one-kernel
+  nothing-installed-nothing-built
+  one-required-module-blocked
+  running-kernel-gets-no-modules
   dkms-lies-no-ko
   stale-registration-removed-then-build-fails
   psys-rebuild-produces-no-ko
   psys-patch-half-applies
   udev-rule-write-fails
   howdy-only-without-howdy
+  howdy-hook-fails-in-a-full-install
   secure-boot-not-enforced
   secure-boot-enforced-unsigned
   secure-boot-lockdown-integrity
@@ -127,14 +167,18 @@ declare -A RULE=(
   [running-kernel-no-build-tree]="no headers for the kernel you are ON: refuse and name that kernel"
   [running-kernel-no-build-tree-force]="--force past it still fails: the reboot would change nothing"
   [mkinitcpio-fails]="initramfs generator exits 1: the install is NOT in effect, so neither is exit 0"
-  [dkms-all-builds-fail]="nothing built anywhere: NOTHING WAS INSTALLED, never Done"
-  [dkms-fails-for-one-kernel]="built for A, failed for B: fail, and name B"
+  [dkms-all-builds-fail]="nothing built anywhere: NOTHING WAS INSTALLED, never Done, and the count line says 0"
+  [dkms-fails-for-one-kernel]="built for A, failed for B: fail, name B, and count B's modules as 0 (ONLY the per-kernel verdict can fire here)"
+  [nothing-installed-nothing-built]="every module blocked before its first build: zero-modules is the ONLY verdict that can fire"
+  [one-required-module-blocked]="one required module blocked, four installed: the required-module verdict alone, with no build failure anywhere"
+  [running-kernel-gets-no-modules]="the kernel you are ON got nothing while another got everything: say so (shares its RC with the per-kernel verdict)"
   [dkms-lies-no-ko]="dkms exits 0 and no .ko lands: prove from disk, call it FAILED"
   [stale-registration-removed-then-build-fails]="remove succeeded, build then failed: say the module is now absent"
   [psys-rebuild-produces-no-ko]="no verified psys module: say the psys fixes are not in what the kernel loads"
   [psys-patch-half-applies]="dry run clean, apply failed: restore the vendor tree and fail"
   [udev-rule-write-fails]="a rule that was not written is a failure, not a footnote"
   [howdy-only-without-howdy]="--howdy-only with no Howdy achieved nothing: exit 1"
+  [howdy-hook-fails-in-a-full-install]="the kernel phase worked and a Howdy step did not: face auth will not work, so not Done"
   [secure-boot-not-enforced]="Secure Boot ON but signatures unenforced: that is fine, and it must say why"
   [secure-boot-enforced-unsigned]="the kernel will refuse every module it just installed: exit 1"
   [secure-boot-lockdown-integrity]="lockdown [integrity] with Secure Boot OFF still refuses: read the mechanism"
@@ -837,8 +881,57 @@ world_running_kernel_no_build_tree_force(){
   setargs --force
 }
 world_mkinitcpio_fails(){ setenv BT_MKINITCPIO_RC 1; }
-world_dkms_all_builds_fail(){ setenv BT_DKMS_FAIL_ALL 1; }
-world_dkms_fails_for_one_kernel(){ setenv BT_DKMS_FAIL_KERNELS "$KB"; }
+
+# --- isolation helpers ------------------------------------------------------
+# A machine that never installed intel-ipu7-dkms-git: no ipu7-drivers source
+# tree, no DKMS registration for it, nothing for the psys phase to patch or
+# rebuild. That is the common case for a fix-pack user AND the only way to test
+# the module verdicts at all: with the tree present, ANY world in which a dkms
+# build fails also fails ipu7-drivers' own rebuild, and IPU7_REBUILD_FAIL sets
+# RC=1 by itself. Both the zero-modules and the per-kernel `RC=1` could be
+# deleted with every scenario still green, because this is what was actually
+# deciding those runs.
+no_ipu7_dkms_tree(){
+  rm -rf "$SB/root/usr-src/ipu7-drivers-$IPUVER" "$SB/root/var-lib-dkms/ipu7-drivers"
+  : >"$SB/dkms-status"
+}
+
+# DKMS already has these modules registered at a version this package does not
+# ship. install.sh refuses to install alongside it (two builds of one module
+# name, and which one loads is undefined) -- so the module fails BEFORE any
+# build is attempted. That is what makes a failure with KBUILD_FAIL=0 possible,
+# and it is not a contrivance: it is what an older copy of this very fix-pack
+# leaves behind.
+dkms_registers_another_version(){
+  local m
+  for m in "$@"; do
+    printf '%s/0.0.from-an-older-fix-pack, %s, x86_64: installed\n' "$m" "$KA" \
+      >>"$SB/dkms-status"
+  done
+}
+
+world_dkms_all_builds_fail(){ setenv BT_DKMS_FAIL_ALL 1; no_ipu7_dkms_tree; }
+world_dkms_fails_for_one_kernel(){ setenv BT_DKMS_FAIL_KERNELS "$KB"; no_ipu7_dkms_tree; }
+world_nothing_installed_nothing_built(){
+  # Nothing is built for anything, and no build FAILS either: every module is
+  # refused at the registration gate. The only verdict left that can fail this
+  # run is "MOD_OK is zero".
+  no_ipu7_dkms_tree
+  dkms_registers_another_version hm1092 intel-cvs int3472-patched \
+                                 ipu-bridge-patched ov05c10
+}
+world_one_required_module_blocked(){
+  # Four modules install for both kernels; one required module is refused at the
+  # registration gate, so MOD_OK > 0 and KBUILD_FAIL is 0. The "required
+  # module(s) did not install" verdict is the only one that can fire.
+  dkms_registers_another_version hm1092
+}
+world_running_kernel_gets_no_modules(){
+  # The mirror image of dkms-fails-for-one-kernel: the kernel that gets nothing
+  # is the one the user is running.
+  setenv BT_DKMS_FAIL_KERNELS "$KA"
+  no_ipu7_dkms_tree
+}
 world_dkms_lies_no_ko(){ setenv BT_DKMS_SILENT_MODULES "intel-cvs"; }
 world_stale_registration_removed_then_build_fails(){
   # A registration pointing at a tree that is not the one we are about to
@@ -859,6 +952,16 @@ world_udev_rule_write_fails(){ write_install_shim "$SB"; }
 world_howdy_only_without_howdy(){
   setargs --howdy-only
   setenv BT_EXTRA_PATH ""
+}
+world_howdy_hook_fails_in_a_full_install(){
+  # Everything the kernel phase does succeeds. Howdy is installed, its recorders
+  # directory is found, ir_reader.py lands, config.ini is rewritten -- and the
+  # one file the IR plugin has to be hooked into is not a usable file. The
+  # README says this case happens ("your Howdy version differs"), and until this
+  # scenario existed install.sh exited 0 and printed "==> Done" for it: the user
+  # reboots and face auth never works.
+  rm -f "$SB/howdyroot/recorders/video_capture.py"
+  mkdir -p "$SB/howdyroot/recorders/video_capture.py"
 }
 enforce_sig(){ echo Y >"$SB/root/sys/module/module/parameters/sig_enforce"; }
 world_secure_boot_not_enforced(){ setenv BT_SB_STATE enabled; }
@@ -1020,12 +1123,98 @@ assert_dkms_all_builds_fail(){
   expect_say 'NOTHING WAS INSTALLED' "that nothing was installed"
   expect_say 'Do not reboot expecting a change' "not to reboot"
   expect_silent '==> Done' "Done"
+  # The count line, in a run that FAILED. Asserting it only in successful runs
+  # is how a constant satisfies every assertion there is: with `5 / 5` printed
+  # unconditionally, this suite stayed green above five lines of
+  # "NOT INSTALLED for any kernel".
+  expect_say 'modules installed *: 0 / 5' "the headline count, and it is zero"
+  expect_say 'modules failed *: 4' "the four required modules, counted"
+  expect_say "$KA +0 of 5 module\(s\)" "nothing for the kernel you are running"
+  expect_say "$KB +0 of 5 module\(s\)" "nothing for the other kernel either"
+  expect_say 'per-kernel builds *: 0 ok, [1-9][0-9]* failed' "no build succeeded anywhere"
+  expect_say 'NOT INSTALLED for any kernel' "the per-module verdict, spelled out"
+  # Isolation: nothing else in this world can set RC.
+  expect_silent 'ipu7-drivers *: FAILED for' "an ipu7-drivers failure (there is no such tree here)"
+  expect_say 'howdy steps *: [1-9][0-9]* ok, 0 failed' "that the Howdy phase succeeded"
 }
 assert_dkms_fails_for_one_kernel(){
   expect_rc_not 0
   expect_say "build FAILED for $KB" "the failing kernel, by name"
   expect_say "Booting these kernels leaves the camera broken: .*$KB" "what booting B costs"
   expect_say "$KA" "the kernel that DID get the modules"
+  expect_silent '==> Done' "Done"
+  # The counts, in a run that FAILED. The headline used to count a module that
+  # landed on at least ONE kernel, so it read "5 / 5" in exactly this run --
+  # printed above the per-kernel table that says a kernel got nothing. Both the
+  # headline and the partial line are pinned here, because the number a user
+  # reads first is the one that decides whether they read the rest.
+  expect_say 'modules installed *: 0 / 5' "that not one module landed on every kernel"
+  expect_say 'partly installed *: 5 ' "the five modules that landed on SOME kernels only"
+  expect_say "$KA +5 of 5 module\(s\)" "five of five for the kernel that built"
+  expect_say "$KB +0 of 5 module\(s\)" "zero of five for the kernel that did not"
+  expect_say 'per-kernel builds *: 5 ok, 5 failed' "half the builds failed, counted"
+  # Isolation: with no ipu7-drivers tree in this world, the per-kernel verdict
+  # is the only thing that can fail this run. Before that, IPU7_REBUILD_FAIL was
+  # deciding it, and `RC=1` could be deleted from the per-kernel verdict with
+  # this scenario still passing.
+  expect_silent 'ipu7-drivers *: FAILED for' "an ipu7-drivers failure"
+  expect_say 'patches *: 0 applied, 0 failed' "that no patch was even attempted"
+  expect_say 'howdy steps *: [1-9][0-9]* ok, 0 failed' "that the Howdy phase succeeded"
+  expect_silent 'NOTHING WAS INSTALLED' "the zero-modules verdict (5 modules did install)"
+}
+assert_nothing_installed_nothing_built(){
+  expect_rc_not 0
+  expect_say 'a DIFFERENT version is already registered with DKMS' \
+    "why no module could be installed"
+  expect_say 'NOTHING WAS INSTALLED' "the verdict this scenario exists to test"
+  expect_say 'Do not reboot expecting a change' "not to reboot"
+  expect_say 'modules installed *: 0 / 5' "zero of five"
+  expect_say "$KA +0 of 5 module\(s\)" "zero for the running kernel"
+  expect_say "$KB +0 of 5 module\(s\)" "zero for the other kernel"
+  expect_silent '==> Done' "Done"
+  # Isolation, asserted rather than promised: not one build was attempted, so
+  # the per-kernel verdict CANNOT be what failed this run, and neither can any
+  # of the psys, udev, signing or Howdy verdicts.
+  expect_say 'per-kernel builds *: 0 ok, 0 failed' \
+    "that no build was even attempted — the per-kernel verdict cannot be firing"
+  expect_say 'patches *: 0 applied, 0 failed' "that no patch was attempted"
+  expect_say 'howdy steps *: [1-9][0-9]* ok, 0 failed' "that every Howdy step worked"
+  expect_say 'initramfs *: regenerated' "that the initramfs was regenerated"
+  expect_silent 'udev rules *: [0-9]+ failed' "a udev failure"
+  expect_silent 'ipu7-drivers *: FAILED for' "an ipu7-drivers failure"
+  expect_silent 'required module\(s\) did not install' \
+    "the OTHER module verdict (it is the elif of this one, and must stay unreached)"
+}
+assert_one_required_module_blocked(){
+  expect_rc_not 0
+  expect_say 'hm1092: a DIFFERENT version is already registered with DKMS' \
+    "which module, and why it was refused"
+  expect_say 'required module\(s\) did not install: hm1092' "the verdict, naming the module"
+  expect_say 'modules installed *: 4 / 5' "four of five, in a run that failed"
+  expect_say 'modules failed *: 1' "one module failed, counted"
+  expect_silent '==> Done' "Done"
+  # Isolation: four modules installed for both kernels and not one build failed.
+  expect_say 'per-kernel builds *: 8 ok, 0 failed' \
+    "that every build that ran succeeded — the per-kernel verdict cannot be firing"
+  expect_silent 'NOTHING WAS INSTALLED' "the zero-modules verdict (four modules installed)"
+  expect_silent 'ipu7-drivers *: FAILED for' "an ipu7-drivers failure"
+  expect_say 'howdy steps *: [1-9][0-9]* ok, 0 failed' "that the Howdy phase succeeded"
+}
+assert_running_kernel_gets_no_modules(){
+  # NOT an isolated verdict, and the table says so: a kernel that got nothing
+  # while another got everything is arithmetically the same event as a per-kernel
+  # build failure, so both verdicts fire here and neither can be mutated away
+  # alone. What this scenario protects is the SENTENCE — the author's own
+  # 2026-07-17 incident was a run that rebuilt for one kernel, reported success,
+  # and left the kernel actually being booted with a dead camera.
+  expect_rc_not 0
+  expect_say "no module was installed for the kernel you are running \($KA\)" \
+    "that the kernel you are ON is the one that got nothing"
+  expect_say 'rebooting into it changes nothing' "what the reboot would achieve"
+  expect_say "$KA +0 of 5 module\(s\)" "zero of five for the running kernel"
+  expect_say "$KB +5 of 5 module\(s\)" "five of five for the kernel you are not on"
+  expect_say 'modules installed *: 0 / 5' "that not one module landed on every kernel"
+  expect_say 'partly installed *: 5 ' "the five modules that landed on the other kernel only"
   expect_silent '==> Done' "Done"
 }
 assert_dkms_lies_no_ko(){
@@ -1071,6 +1260,31 @@ assert_howdy_only_without_howdy(){
   expect_say 'Howdy is not installed' "that Howdy, not the camera, is missing"
   expect_say 'no Howdy step succeeded' "that the run achieved nothing"
   expect_silent '==> Done' "Done"
+}
+assert_howdy_hook_fails_in_a_full_install(){
+  # The trap: every kernel-side verdict in this run is green. Until this
+  # scenario existed, `RC=1` could be deleted from the Howdy-failure verdict
+  # with the whole suite green, and this exact world exited 0 and printed
+  # "==> Done" with the IR plugin unhooked.
+  expect_rc_not 0
+  expect_say 'video_capture.py does not exist' "which file could not be hooked"
+  expect_say 'Howdy step\(s\) failed' "the verdict"
+  expect_say 'IR face auth will not work' "what it costs the user"
+  expect_say 'howdy steps *: [0-9]+ ok, 1 failed' "the failed step, counted"
+  expect_silent '==> Done' "Done"
+  expect_silent 'REBOOT is required' "a reboot instruction for an install that is not finished"
+  # Isolation: the Howdy verdict is the only one that can fail this run.
+  expect_say 'modules installed *: 5 / 5' "that all five modules did install"
+  expect_say 'per-kernel builds *: [1-9][0-9]* ok, 0 failed' "that no build failed"
+  expect_say 'patches *: [1-9][0-9]* applied, 0 failed' "that no patch failed"
+  expect_say 'initramfs *: regenerated' "that the initramfs was regenerated"
+  expect_silent 'udev rules *: [0-9]+ failed' "a udev failure"
+  expect_silent 'ipu7-drivers *: FAILED for' "an ipu7-drivers failure"
+  expect_silent 'NOTHING WAS INSTALLED' "a module verdict"
+  # ...and the one Howdy step that CAN still happen, did: a run that fails one
+  # step must not quietly skip the rest.
+  expect_say 'installed .*/ir_reader.py' "that ir_reader.py was installed anyway"
+  expect_say 'recording_plugin=ir, dark_threshold=90, timeout=6' "that config.ini was still written"
 }
 assert_secure_boot_not_enforced(){
   # Secure Boot ON is NOT by itself a reason to fail: Arch and CachyOS ship
