@@ -228,7 +228,7 @@ else
         sub "   patches, so the usual fix does not apply and re-running it will"
         sub "   change nothing. psys is deferring for a different reason."
         sub "   This is worth reporting rather than retrying."
-        next "the psys patches are already applied and built — do NOT re-run fix-psys-defer.sh; open an issue with this output plus: sudo dmesg | grep -iE 'ipu7|psys'"
+        next "the psys patches are already applied and built — do NOT re-run fix-psys-defer.sh; open an issue with this output plus the UNFILTERED log: sudo dmesg | grep -n -B5 -A40 -iE 'psys|WARNING:|Call Trace:'   (a psys-only filter hides the kernel WARN that explains it)"
       fi
     else
       sub "   fix-psys-defer.sh cannot help here: it patches an ipu7-drivers"
@@ -251,6 +251,20 @@ else
     if [ -n "$r" ]; then
       sub "kernel says:"
       printf '%s\n' "$r" | sed 's/^/           /'
+
+      # A kernel WARN() prints a stack trace whose lines contain neither "psys"
+      # nor "ipu7", so the filter above deletes it outright. Not hypothetical:
+      # psys probe failing with -EINVAL from kobject_add_internal() comes with
+      # "attempted to be registered with empty name" and a full backtrace, and a
+      # reporter's filtered logs hid exactly that for four rounds while I guessed
+      # at causes. If warnings sit anywhere in the log, point at them.
+      w=$(dmesg 2>/dev/null | grep -icE 'WARNING:|Call Trace:|empty name')
+      if [ "${w:-0}" -gt 0 ]; then
+        sub "   NOTE: the log also holds $w warning/backtrace line(s) that a"
+        sub "   psys/ipu7 filter hides. A WARN is how the kernel reports the"
+        sub "   CAUSE of an -EINVAL like this — read them:"
+        sub "     sudo dmesg | grep -n -B5 -A40 -iE 'WARNING:|empty name'"
+      fi
       case $r in
         *"Key was rejected"*|*"signature"*)
           next "the kernel REJECTED the module's signature — enrol your DKMS key with mokutil, or disable Secure Boot" ;;
