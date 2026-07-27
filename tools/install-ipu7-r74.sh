@@ -123,8 +123,18 @@ fi
 # --- fetch r74 ---------------------------------------------------------------
 say "Fetching ipu7-drivers $R74_VER"
 SRC=/usr/src/ipu7-drivers-$R74_VER
-if [[ -d $SRC && -f $SRC/dkms.conf ]]; then
-  ok "already present at $SRC"
+# Reusing an existing tree skips the PACKAGE_VERSION rewrite below, so check it
+# here: dkms matches the directory name against PACKAGE_VERSION, and a mismatch
+# makes `dkms add` succeed while every later command addresses a different tree.
+# A leftover from an interrupted run would have been accepted with a ✓.
+if [[ -d $SRC && -f $SRC/dkms.conf ]] \
+   && grep -q "^PACKAGE_VERSION=\"$R74_VER\"$" "$SRC/dkms.conf"; then
+  ok "already present at $SRC (PACKAGE_VERSION=$R74_VER)"
+elif [[ -d $SRC && -f $SRC/dkms.conf ]]; then
+  bad "$SRC exists but its dkms.conf says $(sed -n 's/^PACKAGE_VERSION=//p' "$SRC/dkms.conf" | head -1), not \"$R74_VER\""
+  echo "       dkms would address a different tree than the one this builds."
+  echo "       Remove it and re-run:  sudo rm -rf $SRC"
+  exit 1
 else
   TMP=$(mktemp -d)
   run git clone -q "$UPSTREAM" "$TMP/src"
@@ -197,7 +207,19 @@ fi
 say "Building for every installed kernel"
 if [[ -n ${CUR:-} && $CUR != "$R74_VER" ]]; then
   run dkms remove "ipu7-drivers/$CUR" --all || true
-  ok "removed $CUR"
+  # `|| true` swallowed the failure and the ✓ printed anyway. Ask dkms what it
+  # still has: an old revision left registered is what the next `dkms
+  # autoinstall` rebuilds, so a false "removed" here is the broken module
+  # coming straight back.
+  if [[ $DRY -eq 1 ]]; then
+    printf '    would remove ipu7-drivers/%s\n' "$CUR"
+  elif dkms status 2>/dev/null | grep -qE "^ipu7-drivers[/,] *$CUR"; then
+    warn "dkms still lists ipu7-drivers/$CUR — the old revision was NOT removed"
+    echo "         it can be rebuilt by 'dkms autoinstall' and shadow r74 again"
+    echo "         remove it by hand: sudo dkms remove ipu7-drivers/$CUR --all"
+  else
+    ok "removed $CUR"
+  fi
 fi
 run dkms add "ipu7-drivers/$R74_VER" >/dev/null 2>&1 || true
 

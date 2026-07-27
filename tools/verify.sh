@@ -294,7 +294,17 @@ fi
 # ---------------------------------------------------------------------------
 sec "-- IR camera / face unlock --"
 IR_BROKEN=0
-if [ $HAS_IR -eq 0 ]; then
+if [ $HAS_IR -eq 0 ] && [ -z "${HW_SENSORS:-}" ]; then
+  # "no IR sensor on this board" is a claim, and an empty firmware sensor list
+  # is not evidence for it -- it is the absence of evidence either way. Saying
+  # n/a here would let a machine whose ACPI could not be read reach RESULT: OK
+  # on the strength of a check that never found anything to look at.
+  p "IR path" "not tested — this machine's firmware declared no sensor ids"
+  sub "no HIMX1092/OVTI08F4/OVTI05C1/INT3472 under /sys/bus/acpi/devices, and no"
+  sub "hm1092 entity in the media graph. That is not the same as 'this board has"
+  sub "no IR sensor' — it means nothing was found to answer the question with."
+  untested "whether this board has an IR sensor could not be established: the firmware declared no sensor ids and there is no hm1092 in the media graph"
+elif [ $HAS_IR -eq 0 ]; then
   p "IR path" "n/a (no IR sensor on this board)"
   sub "HIMX1092 is not declared by this machine's firmware and no hm1092 entity"
   sub "is in the media graph. This is normal on RGB-only boards — nothing below"

@@ -92,8 +92,22 @@ if ! grep -qE 'if \(!.*ipu7_bus_ready_to_probe\)' "$F"; then
   exit 1
 fi
 
-cp -a "$F" "$F.pre-deferfix-$(date +%Y%m%d-%H%M%S)"
+BAK="$F.pre-deferfix-$(date +%Y%m%d-%H%M%S)"
+cp -a "$F" "$BAK"
 sed -i -E 's|if \(!.*ipu7_bus_ready_to_probe\)|if (0) /* DKMS struct layout mismatch; skip defer */|' "$F"
+
+# Read the result back before claiming it. `sed -i` reports success when it
+# matched nothing, so "patched:" was printed before anything had been checked
+# -- and this is the script every other tool in the pack sends people to when
+# /dev/ipu7-psys0 is missing.
+if ! grep -q 'DKMS struct layout mismatch' "$F"; then
+  cp -a "$BAK" "$F"
+  echo "FAILED: the edit did not take in $F, and it has been restored from"
+  echo "        $BAK"
+  echo "        Nothing was changed. Inspect the defer check by hand:"
+  grep -n 'ready_to_probe\|EPROBE_DEFER' "$F" || true
+  exit 1
+fi
 
 echo "patched: $F"
 grep -n -A1 'DKMS struct layout mismatch' "$F" | sed 's/^/    /'
