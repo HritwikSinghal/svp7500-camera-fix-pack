@@ -317,6 +317,27 @@ EOF
   expect_fail "$d" "reads unset variable(s)" \
     "a script that reads a library's variables without sourcing the library"
 
+  # 11. A lookup that GREPS CLEAN and still finds nothing. Every search path is
+  #     right, every pattern resolves, the pattern harvest is happy -- and one
+  #     extra condition in the test means the function returns 1 for every
+  #     module. Reading the paths out of the resolver cannot see this; only
+  #     running the resolver can. This is why the function is extracted and
+  #     called instead of parsed.
+  d=$(mutate lookup-greps-clean-finds-nothing)
+  sed -i 's|-f $d/dkms.conf ]]|-f $d/dkms.conf \&\& -f $d/Kbuild ]]|' "$d/install.sh"
+  expect_fail "$d" "CANNOT FIND module 'demo'" \
+    "a module lookup whose paths all resolve but which returns nothing"
+
+  # 12. A fenced transcript of a run that never happened. The old rule --
+  #     "shares SOME wording with install.sh" -- passed invented lines on one
+  #     borrowed fragment and announced that they shared wording, which is the
+  #     README telling the user, with this script's endorsement, to expect
+  #     output this program cannot print.
+  d=$(mutate readme-invented-transcript)
+  printf '\n```\n✓ demo installed and the camera now works\n```\n' >> "$d/README.md"
+  expect_fail "$d" "transcript line install.sh never prints" \
+    "a fenced transcript quoting a line the installer cannot produce"
+
   exit $rc
 fi
 
@@ -413,6 +434,104 @@ if [[ ${#RESOLVER_FNS[@]} -gt 0 ]]; then
                                    | grep '^PLAIN' | grep -oE "$MOD_PAT_RE" | tr -d '"' | sort -u)
 fi
 
+# ---------------------------------------------------------------------------
+# ...and, stronger than either harvest: CALL the lookup.
+#
+# Reading the paths out of the resolver is still only reading. Add one condition
+# to find_src's test -- `&& -f $d/Kbuild` -- and every pattern above still
+# resolves, every per-module line above still says PASS, and install.sh finds
+# nothing at all. The harvest proves the PATTERN resolves; only running the
+# function proves the FUNCTION does, and the function is what ships.
+#
+# So the resolver is extracted from install.sh BY LINE RANGE into a temp file,
+# sourced with HERE set to this package root exactly as install.sh sets it, and
+# called once per module. Nothing else in install.sh runs: only the named
+# function bodies are copied, and they execute in a separate bash with no
+# arguments and no root. The pattern harvest stays as a second, weaker check --
+# the two catch different regressions (a broken function that greps clean, and
+# a stray path expression the function never touches).
+fn_range(){ # <script> <fn> -> "first last" line of that function's definition
+  awk -v fn="$2" '
+    !inb {
+      if ($0 ~ "^[[:space:]]*(function[[:space:]]+)?" fn "[[:space:]]*\\(\\)[[:space:]]*\\{") {
+        start=NR; rest=$0; sub(/^[^{]*\{/,"",rest)
+        if (rest ~ /\}[[:space:]]*$/) { print start, NR; exit }
+        inb=1
+      }
+      next }
+    /^[[:space:]]*\}[[:space:]]*$/ { print start, NR; exit }' "$1"
+}
+
+# Which functions to lift out: the resolver, plus every function install.sh
+# ASKS about a module -- `$(count_src "$m")` and friends, the ones whose answer
+# it consumes rather than the ones that go off and install things -- plus
+# anything those call, so the extracted copy is self-contained rather than a
+# fragment that fails to source and quietly sends us back to the weak check.
+# Deliberately not "everything called with $m": install_module() would drag in
+# dkms and half the script, and none of it decides where a module lives.
+mapfile -t ALL_FNS < <(fn_names "$INSTALL")
+EXTRACT_FNS=()
+add_fn(){ local x; for x in "${EXTRACT_FNS[@]:-}"; do [[ $x == "$1" ]] && return 0; done; EXTRACT_FNS+=("$1"); }
+for fn in "${RESOLVER_FNS[@]:-}"; do [[ -n $fn ]] && add_fn "$fn"; done
+for fn in "${ALL_FNS[@]:-}"; do
+  [[ -n $fn ]] || continue
+  grep -qE "[\$]\([[:space:]]*${fn}[[:space:]]+\"?[\$]\{?m\}?\"?" "$INSTALL" && add_fn "$fn"
+done
+CALL_POS='(^|[;&|(]|[[:space:]]&&[[:space:]]|[[:space:]][|][|][[:space:]]|[$][(])[[:space:]]*'
+for _ in 1 2 3; do                      # transitive closure, bounded
+  before=${#EXTRACT_FNS[@]}
+  for fn in "${EXTRACT_FNS[@]:-}"; do
+    body=$(fn_body "$INSTALL" "$fn")
+    for c in "${ALL_FNS[@]:-}"; do
+      [[ -n $c && $c != "$fn" ]] || continue
+      grep -qE "$CALL_POS$c([[:space:]]|\$|\))" <<<"$body" && add_fn "$c"
+    done
+  done
+  [[ ${#EXTRACT_FNS[@]} -eq $before ]] && break
+done
+
+LOOKUP_LIB=$(mktemp); LOOKUP_RUN=$(mktemp)
+trap 'rm -f "$LOOKUP_LIB" "$LOOKUP_RUN"' EXIT   # both are removed below; this
+                                                # only covers a death in between
+cat > "$LOOKUP_RUN" <<'RUNNER'
+#!/usr/bin/env bash
+# Run install.sh's own module lookup. $1 = the extracted function bodies,
+# $2 = the function, $3 = the module. HERE comes from the environment, which is
+# what install.sh sets it to: the package root. 97 = the extract will not
+# source, 98 = the function is not defined in it. Neither is "module missing".
+HERE=${HERE:?}
+. "$1" || exit 97
+declare -F "$2" >/dev/null 2>&1 || exit 98
+"$2" "$3"
+RUNNER
+build_lib(){ # <fn>... -> writes $LOOKUP_LIB, non-zero if it will not parse
+  local fn r; : > "$LOOKUP_LIB"
+  for fn in "$@"; do
+    r=$(fn_range "$INSTALL" "$fn"); [[ -n $r ]] || return 1
+    sed -n "${r% *},${r#* }p" "$INSTALL" >> "$LOOKUP_LIB"
+    printf '\n' >> "$LOOKUP_LIB"
+  done
+  bash -n "$LOOKUP_LIB" 2>/dev/null
+}
+call_resolver(){ HERE="$ROOT" bash "$LOOKUP_RUN" "$LOOKUP_LIB" "$1" "$2"; }
+
+FN_CALLABLE=0
+if [[ ${#RESOLVER_FNS[@]} -gt 0 && ${#ALL_M[@]} -gt 0 ]]; then
+  if build_lib "${EXTRACT_FNS[@]}" || build_lib "${RESOLVER_FNS[@]}"; then
+    call_resolver "${RESOLVER_FNS[0]}" "${ALL_M[0]}" >/dev/null 2>&1
+    case $? in
+      97) warn "install.sh's ${RESOLVER_FNS[0]}() cannot be extracted and run (the copy will not parse)" \
+               "falling back to reading its search patterns — weaker: a lookup can grep clean and still find nothing" ;;
+      98) warn "install.sh's ${RESOLVER_FNS[0]}() was not defined by its own extracted body" \
+               "falling back to reading its search patterns — weaker: a lookup can grep clean and still find nothing" ;;
+      *)  FN_CALLABLE=1 ;;
+    esac
+  else
+    warn "cannot lift install.sh's module lookup out of the file to run it" \
+         "falling back to reading its search patterns — weaker: a lookup can grep clean and still find nothing"
+  fi
+fi
+
 mod_expand(){ local e=${1//\$HERE/$ROOT}; e=${e//\$\{m\}/$2}; printf '%s' "${e//\$m/$2}"; }
 mod_hit(){ # <pattern> <module> -> prints the source dir it resolves to, or fails
   local e d; e=$(mod_expand "$1" "$2")
@@ -437,6 +556,8 @@ else
   if [[ ${#LOOKUP_PATTERNS[@]} -gt 0 ]]; then
     SEARCH_PATS=("${LOOKUP_PATTERNS[@]}")
     info "module lookup ${RESOLVER_FNS[*]}() searches: ${SEARCH_PATS[*]}"
+    [[ $FN_CALLABLE -eq 1 ]] && \
+      info "and ${RESOLVER_FNS[*]}() itself is being RUN, from ${EXTRACT_FNS[*]}() lifted out of install.sh"
   else
     SEARCH_PATS=("${MOD_PATTERNS[@]}")
     if [[ ${#RESOLVER_FNS[@]} -eq 0 ]]; then
@@ -451,6 +572,7 @@ else
   fi
   LOOKUP_BROKEN=0
   for m in "${ALL_M[@]}"; do
+    # (a) the weaker question, kept: do the harvested patterns resolve?
     found=""; tried=()
     for pat in "${SEARCH_PATS[@]}"; do
       tried+=("$(rel "$(mod_expand "$pat" "$m")")")
@@ -459,9 +581,60 @@ else
     done
     optional=0
     for o in "${OPTIONAL_M[@]:-}"; do [[ $o == "$m" ]] && optional=1; done
-    if [[ -n $found ]]; then
-      pass "$m -> $(rel "$found")/dkms.conf"
-    elif [[ $optional -eq 1 && -z $(ls -d "$ROOT"/dkms/"$m"* "$ROOT"/kernel/"$m"* 2>/dev/null) ]]; then
+    unshipped=0
+    [[ -z $(ls -d "$ROOT"/dkms/"$m"* "$ROOT"/kernel/"$m"* 2>/dev/null) ]] && unshipped=1
+
+    # (b) the real question: hand the module to install.sh's own resolver and
+    #     see what it says. Returning 0 is not enough -- it has to hand back a
+    #     directory that actually holds a dkms.conf, because that is the path
+    #     install.sh goes on to copy and `dkms add`.
+    fn_found=""; fn_why=""
+    if [[ $FN_CALLABLE -eq 1 ]]; then
+      for fn in "${RESOLVER_FNS[@]}"; do
+        out=$(call_resolver "$fn" "$m" 2>/dev/null); e=$?
+        if [[ $e -ne 0 ]]; then
+          fn_why="install.sh's $fn(\"$m\") returned $e — the installer's own lookup finds nothing"
+        elif [[ -z $out ]]; then
+          fn_why="install.sh's $fn(\"$m\") reported success but printed no path"
+        elif [[ ! -d $out ]]; then
+          fn_why="install.sh's $fn(\"$m\") returned '$out', which is not a directory"
+        elif [[ ! -f $out/dkms.conf ]]; then
+          fn_why="install.sh's $fn(\"$m\") returned '$(rel "$out")', which holds no dkms.conf"
+        else
+          fn_found=$out; continue
+        fi
+        fn_found=""; break
+      done
+    fi
+
+    if [[ $FN_CALLABLE -eq 1 && -n $fn_found ]]; then
+      pass "$m -> $(rel "$fn_found")/dkms.conf  (install.sh's own ${RESOLVER_FNS[*]}() was run and returned it)"
+      [[ -z $found ]] && \
+        warn "the pattern harvest no longer resolves '$m', although ${RESOLVER_FNS[*]}() does" \
+             "harvested: ${SEARCH_PATS[*]}" \
+             "the second, weaker check has drifted and can no longer corroborate the lookup"
+    elif [[ $FN_CALLABLE -eq 1 && $optional -eq 1 && $unshipped -eq 1 ]]; then
+      warn "optional module '$m' is named by install.sh but not shipped at all" \
+           "boards that need it get nothing; install.sh will skip it by design"
+    elif [[ $FN_CALLABLE -eq 1 ]]; then
+      LOOKUP_BROKEN=1
+      shipped=$(cd "$ROOT" && ls -d dkms/"$m"* kernel/"$m"* 2>/dev/null | tr '\n' ' ')
+      if [[ -n $found ]]; then
+        # The masking shape, named out loud: the glob a reader would check by
+        # hand still resolves; the code that ships does not.
+        fail "install.sh CANNOT FIND module '$m' — it would skip it and still report success" \
+             "$fn_why" \
+             "the harvested patterns DO resolve it ($(rel "$found")) — the pattern is fine, the function is not" \
+             "shipped:  ${shipped:-(nothing matching)}"
+      else
+        fail "install.sh CANNOT FIND module '$m' — it would skip it and still report success" \
+             "$fn_why" \
+             "searched: ${tried[*]}" \
+             "shipped:  ${shipped:-(nothing matching)}"
+      fi
+    elif [[ -n $found ]]; then
+      pass "$m -> $(rel "$found")/dkms.conf  (by pattern only — the lookup itself could not be run)"
+    elif [[ $optional -eq 1 && $unshipped -eq 1 ]]; then
       warn "optional module '$m' is named by install.sh but not shipped at all" \
            "boards that need it get nothing; install.sh will skip it by design"
     else
@@ -492,10 +665,11 @@ else
       fail "install.sh uses the path '$pat' outside its candidate list; it resolves for ${#ALL_M[@]} modules minus: ${misses[*]}" \
            "that step is skipped for those modules while the rest of the run reports success"
     else
-      pass "direct path '$pat' resolves for all ${#ALL_M[@]} module(s)"
+      pass "pattern check: direct path '$pat' resolves for all ${#ALL_M[@]} module(s)"
     fi
   done
 fi
+rm -f "$LOOKUP_LIB" "$LOOKUP_RUN"
 
 # the reverse: a module in the package that the installer never names is a
 # module nobody receives -- the same silent no-op, one level up. This is a
@@ -1062,10 +1236,39 @@ section "the README quotes the installer's REAL output"
 #            Every literal run between <placeholders> must be in install.sh.
 #            This is the one that shipped wrong, so a mismatch is a FAIL.
 #   SAMPLE — a line inside a fenced transcript. It carries one machine's real
-#            kernel and module names, so it cannot match verbatim; it only has
-#            to share SOME run of words with install.sh, or it is a transcript
-#            of a program this package does not contain.
+#            kernel and module names, so it cannot match verbatim -- but it is
+#            still an INSTANCE of a message install.sh prints. Mask the
+#            machine-specific words and every literal run that remains must be
+#            in install.sh, exactly as for a table row. A mismatch is a FAIL.
+#
+# "Shares SOME wording with install.sh" was the old standard and it endorsed
+# fabrications: `✓ Secure Boot is fine, nothing more to do`, `✓ dkms build
+# succeeded for every kernel on this machine` and `✓ modules installed : 7 / 5
+# and the camera now works` all PASSED, each on the strength of one borrowed
+# fragment, and the check said they "share wording with install.sh". A fenced
+# transcript is a promise about what this program prints; a check that endorses
+# an invented one is worse than no check, because the reader then trusts it.
 sq(){ tr -s ' \t' ' ' ; }                       # whitespace-insensitive compare
+# The machine-specific words of a transcript line -- module names, kernel
+# versions, paths, counts, .ko files -- are exactly the ones install.sh cannot
+# contain literally, so they are masked out and everything else is held to the
+# installer's own wording.
+sample_runs(){ # <bare sample> -> its literal runs, one per line
+  local s run="" cur w; local -a W=()
+  s=$(printf '%s' "$1" | sed 's/<[^>]*>/ @@VAR@@ /g')
+  read -ra W <<<"$s"
+  for w in "${W[@]}"; do
+    cur=${w//[[:punct:]]/}
+    if [[ $w == @@VAR@@ || $w == */* || $w == *.ko || $w =~ [0-9] || " ${ALL_M[*]:-} " == *" $cur "* ]]; then
+      [[ -n $run ]] && printf '%s\n' "$run"
+      run=""
+    else
+      run="${run:+$run }$w"
+    fi
+  done
+  [[ -n $run ]] && printf '%s\n' "$run"
+  return 0
+}
 INSTALL_SQ=$(mktemp); sq < "$INSTALL" > "$INSTALL_SQ"
 n_quoted=0
 while IFS='|' read -r kind q; do
@@ -1098,23 +1301,47 @@ while IFS='|' read -r kind q; do
       pass "README's '$short' matches install.sh"
     fi
   else
-    # the longest run of consecutive words that install.sh also contains
-    read -ra W <<<"$bare"
-    hit=""; len=${#W[@]}
-    while [[ $len -gt 0 && -z $hit ]]; do
-      i=0
-      while [[ $((i + len)) -le ${#W[@]} ]]; do
-        cand="${W[*]:i:len}"
-        if [[ ${#cand} -ge 10 ]] && grep -qF -- "$cand" "$INSTALL_SQ"; then hit=$cand; break; fi
-        i=$((i+1))
-      done
-      len=$((len-1))
+    mapfile -t runs < <(sample_runs "$bare")
+    matched=(); missing=(); checked=0
+    for r in "${runs[@]:-}"; do
+      r=$(printf '%s' "$r" | sq); r=${r#" "}; r=${r%" "}
+      [[ ${#r} -ge 5 ]] || continue           # ")" or "->" proves nothing either way
+      checked=$((checked+1))
+      if grep -qF -- "$r" "$INSTALL_SQ"; then matched+=("$r"); continue; fi
+      # A label the installer builds from a variable ("modules installed" + " :")
+      # is the installer's wording even though the punctuation around it is not,
+      # so a run is given one more chance with its edges trimmed.
+      t=$(printf '%s' "$r" | sed -E 's/^[^[:alnum:]]+//; s/[^[:alnum:]]+$//')
+      if [[ ${#t} -ge 5 ]] && grep -qF -- "$t" "$INSTALL_SQ"; then matched+=("$t"); continue; fi
+      missing+=("$r")
     done
-    if [[ -n $hit ]]; then
-      pass "README sample '$short' shares wording with install.sh"
+    if [[ $checked -eq 0 ]]; then
+      warn "README shows the transcript line '$short' and every word in it is machine-specific" \
+           "nothing in it can be held against install.sh, so it can drift freely"
+    elif [[ ${#missing[@]} -gt 0 ]]; then
+      fail "README shows a transcript line install.sh never prints: '$q'" \
+           "not found in install.sh: $(printf "'%s' " "${missing[@]}")" \
+           "a fenced transcript is a promise about what THIS installer prints — a reader compares their run against it"
     else
-      warn "README shows a sample line install.sh has nothing in common with: '$q'" \
-           "either the installer was reworded or this transcript came from another program"
+      # Every run is install.sh's wording; they must also be ONE of its
+      # messages. Runs borrowed from three different lines are a sentence the
+      # installer cannot produce, however familiar each fragment looks.
+      same=1
+      if [[ ${#matched[@]} -ge 2 ]]; then
+        same=0
+        while IFS= read -r line; do
+          all=1
+          for r in "${matched[@]}"; do [[ $line == *"$r"* ]] || { all=0; break; }; done
+          [[ $all -eq 1 ]] && { same=1; break; }
+        done < "$INSTALL_SQ"
+      fi
+      if [[ $same -eq 1 ]]; then
+        pass "README transcript '$short' is a line install.sh prints"
+      else
+        fail "README shows a transcript line spliced from different install.sh messages: '$q'" \
+             "each of $(printf "'%s' " "${matched[@]}")is in install.sh, but no single line prints them together" \
+             "no run of this installer can produce that line"
+      fi
     fi
   fi
 done < <( {
