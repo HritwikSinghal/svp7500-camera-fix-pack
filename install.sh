@@ -1494,7 +1494,47 @@ if [[ $DO_KERNEL -eq 1 ]]; then
   # package actually shipped, so the fraction never flatters the result.
   TARGETS=${#REQUIRED_MODULES[@]}
   for m in "${OPTIONAL_MODULES[@]}"; do [[ -n ${SRC_OF[$m]:-} ]] && TARGETS=$((TARGETS+1)); done
-  printf '    %-17s : %d / %d\n' "$LBL_INSTALLED" "$MOD_OK" "$TARGETS"
+  # The headline fraction counts a module ONLY if it landed on every kernel
+  # that needs it. The number this line used to print (MOD_OK) counted a module
+  # that landed on at LEAST ONE kernel, so it read "5 / 5" on a machine where
+  # the kernel booted every day got nothing -- printed directly above the
+  # per-kernel table that says so. A numerator that cannot go down is not a
+  # result, and it is the top line a user reads. The partial case still has to
+  # be visible, so it gets its own labelled line underneath rather than being
+  # folded into a fraction that flatters it.
+  MOD_EVERY=0 MOD_PARTIAL=0 HEAD_DEN=0
+  declare -a PARTIAL_MODULES=()
+  for m in "${REQUIRED_MODULES[@]}" "${OPTIONAL_MODULES[@]}"; do
+    [[ -n ${SRC_OF[$m]:-} ]] || continue
+    # Kernels this module was actually aimed at: every kernel with a build
+    # tree, minus the ones where installing ours would be a downgrade (see
+    # int3472_redundant). Counting a deliberate omission as a shortfall would
+    # make the honest thing look like a failure.
+    want=0
+    for k in "${KERNELS[@]:-}"; do
+      [[ -n $k ]] || continue
+      case " ${MOD_NOTNEEDED[$m]:-} " in *" $k "*) ;; *) want=$((want+1)) ;; esac
+    done
+    # Aimed at no kernel at all: it leaves the fraction entirely rather than
+    # dragging the numerator down. The "not needed on:" line below says so.
+    [[ $want -gt 0 ]] || continue
+    HEAD_DEN=$((HEAD_DEN+1))
+    got=0
+    for k in ${MOD_KERNELS[$m]:-}; do got=$((got+1)); done
+    if [[ $got -ge $want ]]; then
+      MOD_EVERY=$((MOD_EVERY+1))
+    elif [[ $got -gt 0 ]]; then
+      MOD_PARTIAL=$((MOD_PARTIAL+1)); PARTIAL_MODULES+=("$m")
+    fi
+  done
+  printf '    %-17s : %d / %d   (on every kernel that needs it)\n' "$LBL_INSTALLED" "$MOD_EVERY" "$HEAD_DEN"
+  if [[ $MOD_PARTIAL -gt 0 ]]; then
+    # Never silent, and never merged upward: a module on some kernels and not
+    # others is the 2026-07-17 incident -- rebuild for one kernel, boot another,
+    # dead camera -- and it must not be readable as a success anywhere.
+    printf '    %-17s : %d   (%s — installed for SOME kernels only; booting the others leaves the camera broken)\n' \
+      "partly installed" "$MOD_PARTIAL" "${PARTIAL_MODULES[*]}"
+  fi
   # WHICH kernels, not just how many. A count cannot tell you that the kernel
   # you boot every day is the one that got nothing.
   for m in "${REQUIRED_MODULES[@]}" "${OPTIONAL_MODULES[@]}"; do
@@ -1566,6 +1606,24 @@ RC=0
 if [[ $DO_KERNEL -eq 1 ]]; then
   # Zero modules installed is a FAILURE, not a "Done". This is the single check
   # that would have caught the empty install on the first user's first run.
+  #
+  # It is kept rather than folded into the MOD_FAIL branch below, and the
+  # `elif` is deliberate, because this branch is the ONLY thing that decides
+  # the exit status in a whole class of worlds: every module that fails BEFORE
+  # its per-kernel build loop is reached leaves KBUILD_FAIL at 0, so the
+  # per-kernel verdict underneath cannot cover for this one. Concretely, all
+  # five of those pre-build exits (see count_module_failure's callers) --
+  # unreadable PACKAGE_VERSION, a conflicting DKMS version already registered,
+  # /usr/src not writable, mkdir failing, the source copy failing -- reach the
+  # summary with MOD_OK=0, MOD_FAIL>0, KBUILD_FAIL=0 and nothing else set.
+  # A read-only /usr/src is the everyday one: dkms never runs, nothing is
+  # built, nothing fails to build, and without the RC=1 below the run prints
+  # "Done" over an install that put no file anywhere.
+  #
+  # Because it is an elif, deleting this RC=1 does NOT fall through to the
+  # MOD_FAIL branch -- the run exits 0. That is what makes it testable, and it
+  # is why the pair must not be merged into two independent ifs: doing so would
+  # let each mask the other and put this check back to being decoration.
   if [[ $MOD_OK -eq 0 ]]; then
     if [[ $DRY_RUN -eq 1 ]]; then
       bad "NOTHING WOULD BE INSTALLED. A real run would change nothing — fix the problems above first."

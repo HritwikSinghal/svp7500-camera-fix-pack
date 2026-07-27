@@ -243,6 +243,15 @@ package (many distros ship IPU7 in-kernel), and it does not affect the exit
 status. By contrast `✗ psys-suspend-BC.patch is not in this package (looked in dkms/ and kernel/ipu7-psys-patches/) — packaging bug, nothing to do with your DKMS install`
 is a bug on our side — report that one.
 
+If you *do* have that DKMS package, check which revision before you blame this
+pack for a camera that stops working: **`ipu7-drivers` r76 and later break psys
+on any distro that ships the staging `intel_ipu7` with the kernel**
+([intel/ipu7-drivers#93](https://github.com/intel/ipu7-drivers/issues/93)), and
+the install can succeed on all counts while `/dev/ipu7-psys0` never appears.
+`tools/install-ipu7-r74.sh --check` says which revision you are on and changes
+nothing; see [r76+](#the-rgb-camera-died-after-a-package-update--ipu7-drivers-r76)
+for the one-command recovery.
+
 ### Secure Boot
 
 Dell ships these laptops with Secure Boot **on**, so read this before you
@@ -478,6 +487,67 @@ backup at a fixed path, overwritten each run, so re-running does not fill
 `/usr/src` with copies. Howdy's `video_capture.py` and `config.ini`, and the
 vendor `ipu-psys.c` before each patch, get a timestamped `.bak-<date>-<time>`
 copy instead, because those are edited in place rather than replaced.
+
+### The RGB camera died after a package update — `ipu7-drivers` r76+
+
+This one is not caused by anything in this pack, it is the most common way the
+camera dies after an ordinary `pacman -Syu` / `paru -Syu`, and nothing on the
+screen names it. **Revisions r76 and later of Intel's `ipu7-drivers` break psys
+on every distro that ships the staging `intel_ipu7` with the kernel** — Arch,
+CachyOS, and anything else on a recent kernel. Upstream:
+[intel/ipu7-drivers#93](https://github.com/intel/ipu7-drivers/issues/93).
+
+The 2026-06-29 vendor drop appends two fields to `struct ipu7_bus_device` and
+makes `ipu7_psys_probe()` write to one of them. That struct is allocated by
+`intel_ipu7`, which came from your kernel and does not have the new fields — so
+psys writes past the end of a kernel-owned allocation. `/dev/ipu7-psys0` never
+appears and the RGB camera is gone. `isys` binds normally, because it ships
+with the kernel, which is exactly what makes the failure look like a sensor or
+a libcamera problem and sends people debugging the wrong component.
+
+Am I affected? This changes nothing:
+
+```bash
+tools/install-ipu7-r74.sh --check
+```
+
+Recovery, one command — it downgrades `ipu7-drivers` to r74, re-applies the
+psys patches, and rebuilds for **every** installed kernel (rebuilding only the
+one you are on is how you get a working camera today and a dead one after the
+next reboot into a different entry):
+
+```bash
+sudo tools/install-ipu7-r74.sh
+sudo tools/install-ipu7-r74.sh --dry-run   # every step, nothing changed
+```
+
+Then keep it there. On Arch-family systems that means listing the package in
+`IgnorePkg` in `/etc/pacman.conf`, or the next full upgrade puts r76 straight
+back:
+
+```
+IgnorePkg = intel-ipu7-dkms-git
+```
+
+`install.sh` does **not** downgrade `ipu7-drivers` for you. It patches whatever
+tree is registered with DKMS and verifies a psys module came out of it; on r76
+that build can succeed and still leave you with no `/dev/ipu7-psys0`, which is
+why this is a separate tool with its own check rather than a step folded into
+the install.
+
+The companion question — whether `int3472-patched` should be installed on a
+given kernel at all — is answered the same way, and `install.sh` already asks
+it per kernel before installing anything:
+
+```bash
+tools/int3472-needed.sh              # the kernel you are running
+tools/int3472-needed.sh 7.1.4        # any installed kernel
+```
+
+Exit `0` means our copy is still needed there; exit `1` means that kernel's
+in-tree `intel_skl_int3472_discrete` already registers the IR flood LED and
+installing ours would take it away. See
+[`int3472-patched`](#2-int3472-patched-dkms) below.
 
 ---
 
