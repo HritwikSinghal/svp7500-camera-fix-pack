@@ -1,133 +1,144 @@
 #!/bin/bash
 # ===========================================================================
-# ipu7 psys: neutralise the ready_to_probe defer check
+# ipu7 psys: bound the ready_to_probe wait instead of trusting or ignoring it
 #
-# SYMPTOM
-#   /dev/ipu7-psys0 never appears. isys binds fine, psys does not. The RGB
-#   camera is missing from `cam -l`, and libcamera has no pipeline to run.
+#   sudo ./fix-psys-defer.sh [/usr/src/ipu7-drivers-<ver>]
 #
-# CAUSE
-#   psys probe starts with
+# THE PROBLEM
+#   psys probe opens with
+#
 #       if (!isp->ipu7_bus_ready_to_probe)
 #               return -EPROBE_DEFER;
-#   `isp` points at a struct ipu7_device that was allocated by the KERNEL's
-#   intel_ipu7 module, but the DKMS psys module was compiled against the
-#   ipu7-drivers headers. The two disagree on the layout of that struct, so the
-#   read lands at the wrong offset, returns garbage, and the check never passes.
-#   psys defers forever.
 #
-#   Check your own machine:
-#       modinfo -n intel_ipu7        # kernel/drivers/staging/media/ipu7/...
-#       modinfo -n intel_ipu7_psys   # updates/dkms/...
-#   Split provenance like that is the trigger. If both come from the same place
-#   the layouts agree and you do not need this patch.
+#   `isp` points at a struct ipu7_device allocated by the KERNEL's intel_ipu7,
+#   while DKMS psys was built against the ipu7-drivers headers. Where the two
+#   disagree on that struct's layout the read lands at the wrong offset and the
+#   flag never reads true, so psys defers forever: /dev/ipu7-psys0 never
+#   appears, PipeWire's libcamera monitor finds nothing, and every application
+#   sees no camera at all -- while `cam -l` and `cam -c` from a terminal work
+#   perfectly, which is what makes this so easy to misdiagnose.
 #
-#   isys performs the identical check but ships from the kernel alongside
-#   intel_ipu7, so its view of the struct is consistent and it binds normally.
-#   That asymmetry is why the failure looks so selective.
+# WHY THIS IS NOT AN UNCONDITIONAL SKIP ANY MORE
+#   It used to replace the condition with `if (0)`. That is correct on a machine
+#   where the flag never arrives, and WRONG on one where it would have: skipping
+#   the wait lets psys probe before intel_ipu7 has finished, and
+#   device_register() then fails with -EINVAL. Measured on two boards
+#   (intel/ipu7-drivers#26):
 #
-# WHY A SCRIPT AND NOT A .patch
-#   The surrounding code moves between ipu7-drivers revisions (r74 carries a
-#   debugfs block that r76 does not, and so on), so a context diff rejects on
-#   versions it was not generated against. This edits the one line by pattern.
+#       this author's Dell XPS 16   skip needed    without it psys never binds
+#       a reporter's Dell           skip harmful   with it, device_register -22
 #
-# USAGE
-#   sudo ./fix-psys-defer.sh                 # auto-detect the DKMS-installed tree
-#   sudo ./fix-psys-defer.sh /usr/src/ipu7-drivers-rNN.xxxxx
+#   Both are explained by the same thing: the flag is simply not ready at first
+#   probe. All that differs is whether proceeding anyway is survivable. So the
+#   right behaviour is neither "always trust the flag" nor "never trust it" --
+#   it is WAIT FOR IT, BOUNDED, and proceed only once waiting has clearly
+#   failed.
+#
+# WHAT THIS DOES
+#   Defer while the flag is false, up to PSYS_READY_TIMEOUT_S seconds from the
+#   first attempt. Past that, warn loudly and proceed. On a board where the flag
+#   arrives, psys now probes at the RIGHT time instead of too early. On a board
+#   where it never arrives, the deadline expires and behaviour is what the old
+#   skip gave -- so nothing that works today regresses.
 # ===========================================================================
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "run as root: sudo $0"; exit 1; }
 
+TIMEOUT_S=${PSYS_READY_TIMEOUT_S:-10}
+
 SRC="${1:-}"
 if [[ -z $SRC ]]; then
-  # Pick the tree DKMS actually HAS. `ls | tail -1` grabs a stale leftover tree
-  # and silently patches source that is never built.
-  #
-  # Parse BOTH `dkms status` formats. dkms >= 3 prints
-  #     ipu7-drivers/0.0.r74, 7.1.4, x86_64: installed
-  # and dkms 2.x (Ubuntu 22.04, older Debian) prints
-  #     ipu7-drivers, 0.0.r74, 7.1.4, x86_64: installed
-  # Reading only the first told every Ubuntu user "ipu7-drivers not installed
-  # under DKMS" and sent them away with a dead camera and nothing to try.
-  V=$(dkms status 2>/dev/null | sed -nE 's|^ipu7-drivers[/,] *([^,:]+).*|\1|p' | head -1)
-  if [[ -z ${V:-} ]]; then
-    # dkms status can be empty while the tree is right there (a registration
-    # dropped by a package upgrade, for one). Look before saying no.
-    for d in /var/lib/dkms/ipu7-drivers/*/; do
-      [[ -d $d ]] || continue
-      b=${d%/}; b=${b##*/}
-      [[ $b == kernel-* ]] && continue
-      [[ -e ${d%/}/source ]] || continue
-      V=$b; break
-    done
-  fi
-  [[ -n ${V:-} ]] || {
-    echo "no ipu7-drivers under DKMS ('dkms status' lists none, and /var/lib/dkms has none)."
-    echo "If your intel_ipu7_psys came from your kernel package rather than DKMS,"
-    echo "this script does not apply -- there is no source tree here to patch."
-    echo "Otherwise pass the source directory:  sudo $0 /usr/src/ipu7-drivers-rNN.xxxxx"
-    exit 1
-  }
-  # Resolve through DKMS's own source link where possible: the tree is not
-  # always at the /usr/src/<name>-<version> path the version string implies.
-  if [[ -e /var/lib/dkms/ipu7-drivers/$V/source ]]; then
-    SRC=$(readlink -f "/var/lib/dkms/ipu7-drivers/$V/source")
-  else
-    SRC=/usr/src/ipu7-drivers-$V
-  fi
+  V=$(dkms status 2>/dev/null | sed -n 's|^ipu7-drivers/\([^,]*\),.*installed.*|\1|p' | head -1)
+  [[ -n ${V:-} ]] || { echo "ipu7-drivers not installed under DKMS; pass the source dir"; exit 1; }
+  SRC=/usr/src/ipu7-drivers-$V
 fi
 
 F="$SRC/drivers/media/pci/intel/ipu7/psys/ipu-psys.c"
 [[ -f $F ]] || { echo "not found: $F"; exit 1; }
 
-if grep -q 'DKMS struct layout mismatch' "$F"; then
+if grep -q 'psys_ready_deadline' "$F"; then
   echo "already applied: $F"
   exit 0
 fi
 
-if ! grep -qE 'if \(!.*ipu7_bus_ready_to_probe\)' "$F"; then
-  echo "defer check not found in $F"
-  echo "either this revision dropped it, or the pattern changed — inspect by hand:"
+# Accept either the pristine condition or the old unconditional skip, so a tree
+# carrying the previous version of this fix upgrades cleanly rather than being
+# reported as an unknown shape.
+if grep -qE 'if \(!.*ipu7_bus_ready_to_probe\)' "$F"; then
+  OLD='if (!adev->isp->ipu7_bus_ready_to_probe)'
+elif grep -q 'DKMS struct layout mismatch' "$F"; then
+  OLD='if (0) /* DKMS struct layout mismatch; skip defer */'
+else
+  echo "neither the defer check nor the old skip was found in $F"
+  echo "inspect by hand:"
   grep -n 'ready_to_probe\|EPROBE_DEFER' "$F" || true
   exit 1
 fi
 
-BAK="$F.pre-deferfix-$(date +%Y%m%d-%H%M%S)"
-cp -a "$F" "$BAK"
-sed -i -E 's|if \(!.*ipu7_bus_ready_to_probe\)|if (0) /* DKMS struct layout mismatch; skip defer */|' "$F"
+cp -a "$F" "$F.pre-deferfix-$(date +%Y%m%d-%H%M%S)"
 
-# Read the result back before claiming it. `sed -i` reports success when it
-# matched nothing, so "patched:" was printed before anything had been checked
-# -- and this is the script every other tool in the pack sends people to when
-# /dev/ipu7-psys0 is missing.
-if ! grep -q 'DKMS struct layout mismatch' "$F"; then
-  cp -a "$BAK" "$F"
-  echo "FAILED: the edit did not take in $F, and it has been restored from"
-  echo "        $BAK"
-  echo "        Nothing was changed. Inspect the defer check by hand:"
-  grep -n 'ready_to_probe\|EPROBE_DEFER' "$F" || true
-  exit 1
-fi
+python3 - "$F" "$OLD" "$TIMEOUT_S" <<'PY'
+import sys, re
+path, old, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3])
+s = open(path).read()
 
-echo "patched: $F"
-grep -n -A1 'DKMS struct layout mismatch' "$F" | sed 's/^/    /'
-cat <<'EOF'
+# NL is assembled at runtime. Writing a literal backslash-n inside a template
+# that passes through a shell heredoc turns it into a REAL newline and splits
+# the C string literal, which does not compile. This has bitten this project
+# before; build the escape rather than typing it.
+NL = chr(92) + "n"
 
-Now rebuild for EVERY installed kernel, not just the running one -- building
-only $(uname -r) leaves the others with an unpatched psys and a dead camera
-after the next boot into them:
+new = (
+ "/*\n"
+ "\t * Wait for intel_ipu7 to declare itself ready, but not forever.\n"
+ "\t *\n"
+ "\t * Where DKMS psys and an in-kernel intel_ipu7 disagree about struct\n"
+ "\t * ipu7_device's layout this flag is read at the wrong offset and never\n"
+ "\t * reads true, so psys would defer for the whole boot and no application\n"
+ "\t * would ever see a camera. Where the layouts DO agree the flag is\n"
+ "\t * meaningful, and skipping the wait makes psys probe too early, which\n"
+ "\t * then fails in device_register() with -EINVAL.\n"
+ "\t *\n"
+ "\t * So defer while it is false, up to %ds from the first attempt, then\n"
+ "\t * proceed and say so. Both boards in intel/ipu7-drivers#26 are satisfied\n"
+ "\t * by this; neither is by a fixed answer in either direction.\n"
+ "\t */\n"
+ "\tif (!adev->isp->ipu7_bus_ready_to_probe) {\n"
+ "\t\tstatic unsigned long psys_ready_deadline;\n"
+ "\n"
+ "\t\tif (!psys_ready_deadline)\n"
+ "\t\t\tpsys_ready_deadline = jiffies + %d * HZ;\n"
+ "\n"
+ "\t\tif (time_before(jiffies, psys_ready_deadline))\n"
+ "\t\t\treturn -EPROBE_DEFER;\n"
+ "\n"
+ "\t\tdev_warn(dev,\n"
+ '\t\t\t "ipu7_bus_ready_to_probe still clear after %ds; proceeding anyway%s");\n'
+ "\t}"
+) % (timeout, timeout, timeout, NL)
 
-    V=$(dkms status | sed -nE 's|^ipu7-drivers[/,] *([^,:]+).*|\1|p' | head -1)
-    for k in $(ls /lib/modules); do
-      [ -d /lib/modules/$k/build ] || continue
-      # --force, NOT remove-then-install: `dkms remove` deletes the psys module
-      # that is working right now, and the build that follows has just had its
-      # source patched, so it is more likely than usual to fail. That sequence
-      # leaves you with no psys module at all.
-      dkms install --force ipu7-drivers/$V -k $k
+pat = re.escape(old) + r'\s*\n\s*return -EPROBE_DEFER;'
+if not re.search(pat, s):
+    sys.exit("could not match the defer statement")
+s = re.sub(pat, lambda _: new, s, count=1)
+open(path, "w").write(s)
+print("  patched")
+PY
+
+echo
+grep -n -A6 'psys_ready_deadline' "$F" | head -12 | sed 's/^/    /'
+cat <<EOF
+
+Now rebuild for EVERY installed kernel. 'dkms install --force' does NOT
+recompile -- it reinstalls a cached artifact -- so the build step is required:
+
+    V=\$(dkms status | sed -n 's|^ipu7-drivers/\\([^,]*\\),.*installed.*|\\1|p' | head -1)
+    for k in \$(ls /lib/modules); do
+      [ -d /lib/modules/\$k/build ] || continue
+      sudo dkms build   --force ipu7-drivers/\$V -k \$k
+      sudo dkms install --force ipu7-drivers/\$V -k \$k
     done
 
-Then REBOOT. Do not modprobe -r intel_ipu7_psys to pick it up live: unloading
-psys page-faults in ipu7_fw_psys_close even at refcount 0, and psys0 stays gone
-until you reboot anyway.
+Then REBOOT. Do not modprobe -r intel_ipu7_psys to pick it up live: it page
+faults in ipu7_fw_psys_close even at refcount 0.
 EOF
