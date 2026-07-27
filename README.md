@@ -152,6 +152,27 @@ sudo ./install.sh               # add --kernel-only if you do not use Howdy
 If the dry run ends in `Dry run found problems`, the real run would hit the same
 ones. Fix them first; you have not touched anything yet.
 
+`sudo ./install.sh --help` lists every flag. The ones worth knowing before you
+start:
+
+| flag | what it does |
+|---|---|
+| `--dry-run` | run every check, print every action, change nothing |
+| `--kernel-only` | modules, psys patches, udev rules, initramfs — no Howdy |
+| `--howdy-only` | Howdy integration only — no DKMS work, no reboot needed |
+| `--no-initramfs` | you will rebuild the initramfs yourself. See the exit table below |
+| `--mok-enrolled` | you sign modules yourself; do not fail on unsigned ones. See [Secure Boot](#secure-boot) |
+| `--force` | continue past the two preflight refusals that are about your *machine* rather than the package: hardware that does not look like a supported board, and a running kernel with no build tree |
+
+**`--force` is the one flag that can leave you worse off**, and it is the only
+place where exit `0` does not also mean *this was a good idea*. On an IPU6 or
+otherwise unrelated Intel MIPI laptop, two of these modules (`ipu-bridge-patched`,
+`int3472-patched`) replace **in-tree** drivers and land in `updates/`, which
+`depmod` prefers — so a forced install overrides working drivers system-wide.
+The installer says so, loudly, and records the way back in its
+`still needs your attention` list. Without `--force` it simply refuses, which is
+what you want.
+
 **You do not have to read the output to know whether it worked.** The exit
 status is the contract:
 
@@ -160,9 +181,18 @@ status is the contract:
 | `0` | everything selected actually happened |
 | `1` | the install did not achieve what it set out to — the last screen names what did not happen |
 | `2` | preflight refused, nothing was touched |
+| `0` **with `--no-initramfs`** | everything **except** the initramfs, which you said you would rebuild yourself. The run's last screen is a `BEFORE YOU REBOOT` block naming the exact command you still owe |
 
 So `sudo ./install.sh && sudo reboot` is safe: a failed install will not let you
-reboot into an unchanged system believing it worked.
+reboot into an unchanged system believing it worked. `--no-initramfs` is the one
+opt-out from that, and it is opt-in by definition — pass it and the reboot is
+yours to sequence.
+
+"Actually happened" includes *will actually load*. If your kernel refuses
+unsigned modules — Secure Boot with signature enforcement, which is the factory
+setting on Dell laptops — and the modules it just built are unsigned, that is a
+failure and it exits `1`, because every one of them would be rejected at boot
+and nothing would be in effect. See [Secure Boot](#secure-boot) below.
 
 **What to expect.** The installer builds every module against *every* installed
 kernel, so you get one `✓` line per module per kernel, and each one is verified
@@ -188,12 +218,53 @@ selftest fails if any of this wording drifts from install.sh:
 | `! <module>: installed for <n> kernel(s), FAILED for: <kernels>` | partial. Booting the failed kernels leaves the camera broken, so this also exits non-zero |
 | `✗ package is missing module '<name>' (no dkms/<name>-*/dkms.conf, no kernel/<name>/dkms.conf) — this clone/tarball is incomplete, re-download it` | **packaging bug — please report it.** This aborts in preflight with exit 2; nothing was touched |
 | `✗ NOTHING WAS INSTALLED. Do not reboot expecting a change — nothing would be different.` | the run achieved nothing and says so. Exit 1 |
+| `✗ the modules will not load on the next boot — this install is on disk but NOT in effect. Do not reboot expecting a working camera.` | Secure Boot / signature enforcement. See below. Exit 1 |
 
 The psys section may legitimately say `! no ipu7-drivers package under DKMS ('dkms status' lists none, and /var/lib/dkms has none) — psys patches do not apply to this system`.
 That is **fine and expected** if you do not have Intel's `ipu7-drivers` DKMS
 package (many distros ship IPU7 in-kernel), and it does not affect the exit
 status. By contrast `✗ psys-suspend-BC.patch is not in this package (looked in dkms/ and kernel/ipu7-psys-patches/) — packaging bug, nothing to do with your DKMS install`
 is a bug on our side — report that one.
+
+### Secure Boot
+
+Dell ships these laptops with Secure Boot **on**, so read this before you
+conclude the pack does not work on your machine.
+
+Secure Boot on its own is not the problem, and the installer does not treat it
+as one — plenty of kernels boot with it enabled and load unsigned modules
+anyway. What matters is whether your kernel *enforces module signatures*
+(`sig_enforce=Y`, or kernel lockdown in `[integrity]`/`[confidentiality]` mode).
+Arch and CachyOS stock kernels do not; Ubuntu and Fedora do.
+
+After the modules are built, the installer reads the signature off the `.ko`
+files that actually landed and checks the signer against your enrolled keys.
+Four outcomes, all printed under `==> Will this kernel load what was just
+installed?` and summarised on the `module signing` line:
+
+| what it prints | exit |
+|---|---|
+| `✓ this kernel does not enforce module signatures — nothing installed above needs to be signed` | `0` |
+| `✓ Secure Boot is ENABLED, but this kernel does not enforce module signatures` … | `0` |
+| `✗ the modules installed above are UNSIGNED and this kernel refuses unsigned modules` … | **`1`** |
+| `!` signed, but the signing key was not found in `mokutil --list-enrolled` or `/proc/keys` | `0`, with a warning — a signature we cannot trace is not proof of anything |
+
+The failing case is the one that used to exit `0`: every module builds, every
+`.ko` lands, the installer proves all of it on disk, and then the kernel refuses
+all five at boot with `Key was rejected by service`. You get three ways out:
+
+1. **Sign them.** Configure DKMS module signing (`sign_tool` or
+   `mok_signing_key` in `/etc/dkms/framework.conf`), re-run the installer, then
+   `sudo mokutil --import <cert>` and enrol at the next boot.
+2. **Turn Secure Boot off** in firmware.
+3. **`sudo ./install.sh --mok-enrolled`** — if you sign modules yourself after
+   the build (a DKMS signing hook that runs later, `sbctl`, a manual
+   `kmodsign` pass). This downgrades the failure to a warning and takes your
+   word for it. It does not sign anything.
+
+`--dry-run` answers the same question in advance: with an enforcing kernel and
+no DKMS signing configured, the rehearsal exits `1` rather than letting you find
+out after the reboot.
 
 ## Step 3 — reboot, but only if step 2 succeeded
 

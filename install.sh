@@ -36,7 +36,7 @@ set -Eeuo pipefail
 # module is found, and preflight tells the user their download is incomplete
 # when it is perfectly intact.
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-DO_KERNEL=1 DO_HOWDY=1 DRY_RUN=0 DO_INITRAMFS=1 FORCE=0
+DO_KERNEL=1 DO_HOWDY=1 DRY_RUN=0 DO_INITRAMFS=1 FORCE=0 MOK_ASSERTED=0
 SEEN_KERNEL_ONLY=0 SEEN_HOWDY_ONLY=0
 
 # The four modules the IR stack cannot work without. Missing any of them is a
@@ -66,17 +66,26 @@ Usage: sudo ./install.sh [--kernel-only|--howdy-only] [--dry-run]
   --no-initramfs    Skip the initramfs rebuild (you must do it yourself, or
                     the kernel keeps loading the modules it already has).
                     This is the ONLY way to finish successfully without a
-                    regenerated initramfs.
+                    regenerated initramfs: exit 0 then means "everything
+                    except the initramfs, which you said you would do".
   --force           Continue past the two preflight refusals that are about
                     your machine rather than the package: hardware that does
                     not look like a supported board, and a running kernel with
                     no build tree. Everything else still applies.
                     --force-no-hardware is accepted as a synonym.
+  --mok-enrolled    Do not fail when this kernel enforces module signatures
+                    and the modules are unsigned. For people who sign modules
+                    themselves after the build (a DKMS signing hook that runs
+                    later, sbctl, a manual kmodsign pass). Without it, an
+                    install whose modules the kernel will refuse at boot is a
+                    FAILURE, because nothing about it is in effect.
+                    --i-have-enrolled-my-mok is accepted as a synonym.
   -h, --help        This text.
 
 Exit status: 0 success — everything selected actually happened,
              1 the install did not achieve what it set out to,
              2 preflight failed / bad usage (nothing was touched).
+             With --no-initramfs, 0 means everything EXCEPT the initramfs.
 
 Before installing:  ./tools/check-hardware.sh   is this package for this laptop?
 After rebooting:    sudo ./tools/verify.sh      did it actually work?
@@ -91,6 +100,7 @@ for a in "$@"; do
     --dry-run)     DRY_RUN=1 ;;
     --no-initramfs) DO_INITRAMFS=0 ;;
     --force|--force-no-hardware) FORCE=1 ;;
+    --mok-enrolled|--i-have-enrolled-my-mok) MOK_ASSERTED=1 ;;
     -h|--help)     usage; exit 0 ;;
     # Unknown flags used to be ignored in silence, so a typo like --kernal-only
     # ran the FULL install while the user believed they had scoped it.
@@ -144,7 +154,10 @@ STEPS_SKIPPED=0
 RUNNING_NOBUILD=0
 HOWDY_PHASE_DONE=0
 SECUREBOOT="not checked"
+SIGNING_STATE="not checked"
+SIGN_FAIL=0
 INITRAMFS_STATE="not attempted"
+declare -a INSTALLED_KOS=()
 declare -a INSTALLED_MODULES=() FAILED_MODULES=() SKIPPED_NOTES=() ACTIONS=()
 declare -a KFAIL_NOTES=() PSYS_SNAPS=() HR_TRIED=() CFG_TRIED=()
 declare -A MOD_KERNELS=() KCOUNT=() KFAIL_KERNELS=()
@@ -374,10 +387,17 @@ else
   esac
 fi
 
-# --- Secure Boot ------------------------------------------------------------
+# --- Secure Boot / module signing -------------------------------------------
 # With Secure Boot on, every dkms build succeeds, every .ko lands, this script
 # can prove all of it, and the kernel then refuses to load a single unsigned
-# module after the reboot. Dell laptops ship with it enabled.
+# module after the reboot with "Key was rejected by service". Dell laptops --
+# which is what every reporter has -- ship with Secure Boot ENABLED.
+#
+# That used to be three warnings and exit 0, which is this package's one
+# remaining "reported success for something that did not happen": the install
+# is on disk and none of it is in effect. It is now checked properly, after
+# the modules exist, and it FAILS. See the "will this kernel load what was
+# just installed" section further down for the verdict.
 sb_state(){
   local o f
   if command -v mokutil >/dev/null 2>&1; then
@@ -397,14 +417,88 @@ sb_state(){
   if [[ -d /sys/firmware/efi ]]; then printf 'unknown (no mokutil, no SecureBoot efivar)'
   else printf 'n/a (not a UEFI boot)'; fi
 }
+
+# Does this kernel actually REFUSE unsigned modules? Secure Boot is the usual
+# reason it does, but it is not the mechanism, and conflating the two gets both
+# cases wrong: a kernel with CONFIG_MODULE_SIG_FORCE off and lockdown [none]
+# loads unsigned modules perfectly well with Secure Boot ENABLED (this is the
+# default on Arch and CachyOS, so failing on Secure Boot alone would fail a
+# large share of correct installs), and a kernel in lockdown integrity mode
+# refuses them with Secure Boot off. Read the mechanism.
+#
+# Prints the evidence, so the message can name why rather than assert it.
+sig_enforce_why(){
+  local v l
+  if [[ -r /sys/module/module/parameters/sig_enforce ]]; then
+    v=$(cat /sys/module/module/parameters/sig_enforce 2>/dev/null || true)
+    [[ $v == Y ]] && { printf 'sig_enforce=Y'; return 0; }
+  fi
+  if [[ -r /sys/kernel/security/lockdown ]]; then
+    l=$(cat /sys/kernel/security/lockdown 2>/dev/null || true)
+    case $l in
+      *'[integrity]'*)       printf 'kernel lockdown is [integrity]';       return 0 ;;
+      *'[confidentiality]'*) printf 'kernel lockdown is [confidentiality]'; return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+# Who signed a module file, if anyone. Empty output = unsigned, which is the
+# whole question. modinfo reads compressed modules (.ko.zst / .ko.xz) too, so
+# this does not need to know how the distro compresses them.
+#
+# `|| true` is load-bearing: this script runs under `set -o pipefail` and an
+# ERR trap, and modinfo exits non-zero on some builds when the field is simply
+# absent -- which is exactly the unsigned case this has to report. Without it
+# the run ABORTS at the moment it finds the problem it exists to find.
+ko_signer(){ modinfo -F signer "$1" 2>/dev/null | head -1 || true; }
+
+# Does this machine trust that signer? A MOK-enrolled certificate is listed by
+# `mokutil --list-enrolled`; every key the kernel loaded into its .builtin,
+# .platform or .machine keyrings is described in /proc/keys (root-only, and we
+# are root). Either is proof.
+# The output is captured before it is searched rather than piped into grep:
+# under `set -o pipefail`, `grep -q` closing the pipe early kills mokutil with
+# SIGPIPE, the pipeline reports 141, and a key that IS enrolled comes back as
+# not found -- a false failure produced by the plumbing.
+key_trusted(){
+  local s=$1 o=""
+  [[ -n $s ]] || return 1
+  if command -v mokutil >/dev/null 2>&1; then
+    o=$(mokutil --list-enrolled 2>/dev/null || true)
+    grep -qF -- "$s" <<<"$o" && return 0
+  fi
+  if [[ -r /proc/keys ]]; then
+    grep -qF -- "$s" /proc/keys && return 0
+  fi
+  return 1
+}
+
+# Is DKMS set up to sign what it builds? Only used by --dry-run, where there is
+# no module on disk yet to read a signature out of. Covers the distro defaults
+# (Arch: /var/lib/dkms/mok.key, Debian/Ubuntu: shim-signed MOK) as well as an
+# explicit sign_tool.
+dkms_signing_configured(){
+  local f
+  for f in /etc/dkms/framework.conf /etc/dkms/framework.conf.d/*.conf; do
+    [[ -f $f ]] || continue
+    grep -qE '^[[:space:]]*(sign_tool|mok_signing_key|mok_certificate)=' "$f" && return 0
+  done
+  for f in /var/lib/dkms/mok.key /var/lib/shim-signed/mok/MOK.priv; do
+    [[ -f $f ]] && return 0
+  done
+  return 1
+}
+
 if [[ $DO_KERNEL -eq 1 ]]; then
   SECUREBOOT=$(sb_state)
+  # Stated, not judged, here: the verdict needs modules on disk to read
+  # signatures out of, so it comes after they are built. Preflight only says
+  # what it found, because a warning here that the run then never revisits is
+  # how "ENABLED" became a footnote on a successful-looking install.
   case $SECUREBOOT in
-    ENABLED)
-      warn "Secure Boot is ENABLED — unsigned DKMS modules will build and install here and then be REFUSED by the kernel at boot ('Key was rejected by service'). Nothing below can detect that; it happens after the reboot."
-      action "Secure Boot is on: enrol your DKMS signing key with MOK (mokutil --import), or disable Secure Boot in firmware — otherwise none of these modules will load"
-      ;;
-    *) ok "secure boot: $SECUREBOOT" ;;
+    ENABLED) warn "Secure Boot is ENABLED — whether that stops these modules loading is checked after they are built, not here" ;;
+    *)       ok "secure boot: $SECUREBOOT" ;;
   esac
 fi
 
@@ -639,9 +733,12 @@ install_module(){
     fi
     # dkms said yes. Now make it prove it: a .ko for every module the
     # dkms.conf promised, on this kernel, in an out-of-tree location.
-    local missing=() wrong=() p
+    # Keep the resolved paths: the module-signing check later reads the
+    # signature off these exact files, not off a path it reconstructs. A check
+    # that guesses where the module landed can only ever prove its own guess.
+    local missing=() wrong=() p kp
     for n in "${names[@]}"; do
-      ko_present "$k" "$n" >/dev/null || missing+=("$n")
+      if kp=$(ko_present "$k" "$n"); then INSTALLED_KOS+=("$kp"); else missing+=("$n"); fi
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
       badk=$((badk+1)); KBUILD_FAIL=$((KBUILD_FAIL+1)); badkernels+=("$k")
@@ -1053,6 +1150,85 @@ fi
 fi
 
 # ---------------------------------------------------------------------------
+# --- will this kernel load what was just installed? -------------------------
+# The last place in this package where "it built, it landed, we proved it is on
+# disk" was allowed to mean success. Under Secure Boot with signature
+# enforcement on, all of that is true and the kernel still refuses every module
+# at boot with "Key was rejected by service" -- and Dell laptops, which is the
+# hardware every reporter has, ship with Secure Boot ENABLED. An install that
+# cannot load is not an install, so it exits non-zero.
+#
+# Evidence, in order of strength:
+#   1. does this kernel enforce signatures at all (not: is Secure Boot on)
+#   2. are the .ko files that just landed actually signed
+#   3. does this machine trust the key they were signed with
+# Only (1) and (2) can produce a hard failure, because only they can be proved
+# in the negative. (3) failing to be provable is a warning: a signed module
+# whose key we cannot find is not evidence of anything, and a check that fails
+# on correct machines is a check someone deletes.
+if [[ $DO_KERNEL -eq 1 ]]; then
+say "Will this kernel load what was just installed?"
+SB_WHY=""
+if ! SB_WHY=$(sig_enforce_why); then
+  if [[ $SECUREBOOT == ENABLED ]]; then
+    SIGNING_STATE="not enforced by this kernel — unsigned modules load"
+    ok "Secure Boot is ENABLED, but this kernel does not enforce module signatures (sig_enforce is not Y, lockdown is not integrity/confidentiality) — the modules above will load unsigned"
+  else
+    SIGNING_STATE="not enforced by this kernel — nothing here needs signing"
+    ok "this kernel does not enforce module signatures — nothing installed above needs to be signed"
+  fi
+elif [[ $DRY_RUN -eq 1 ]]; then
+  # No module exists yet to read a signature from, so the question a dry run
+  # can answer is whether a real run would produce signed ones.
+  if dkms_signing_configured; then
+    SIGNING_STATE="not checked (dry run) — DKMS is configured to sign"
+    ok "this kernel refuses unsigned modules ($SB_WHY) and DKMS is configured to sign them — a real run checks the signature on each module it installs"
+  elif [[ $MOK_ASSERTED -eq 1 ]]; then
+    SIGNING_STATE="not checked (dry run) — --mok-enrolled given"
+    warn "this kernel refuses unsigned modules ($SB_WHY) and DKMS is not configured to sign them — --mok-enrolled was given, so this is taken on trust"
+  else
+    SIGNING_STATE="would be UNSIGNED — DKMS is not configured to sign"
+    SIGN_FAIL=1
+    bad "this kernel refuses unsigned modules ($SB_WHY) and DKMS is not configured to sign them — a real run would install modules the kernel then refuses at boot with 'Key was rejected by service', and nothing would be in effect"
+    action "set up module signing before the real run (a sign_tool or mok_signing_key in /etc/dkms/framework.conf, then 'mokutil --import' the certificate), or turn Secure Boot off in firmware, or re-run with --mok-enrolled if you sign the modules yourself afterwards"
+  fi
+elif [[ ${#INSTALLED_KOS[@]} -eq 0 ]]; then
+  SIGNING_STATE="not checked (nothing was installed)"
+  warn "this kernel refuses unsigned modules ($SB_WHY), but nothing was installed, so there is no module to check"
+else
+  declare -a SB_UNSIGNED=() SB_UNTRUSTED=()
+  declare -A SB_SIGNERS=()
+  for p in "${INSTALLED_KOS[@]}"; do
+    s=$(ko_signer "$p")
+    if [[ -z $s ]]; then SB_UNSIGNED+=("$p"); else SB_SIGNERS[$s]=1; fi
+  done
+  if [[ ${#SB_UNSIGNED[@]} -gt 0 ]]; then
+    if [[ $MOK_ASSERTED -eq 1 ]]; then
+      SIGNING_STATE="UNSIGNED on disk — --mok-enrolled given"
+      warn "${#SB_UNSIGNED[@]} installed module file(s) carry no signature and this kernel refuses unsigned modules ($SB_WHY) — --mok-enrolled was given, so this run assumes you sign them before rebooting"
+      action "sign the modules under /lib/modules/*/updates before you reboot — this run did not verify that they are signed, because you told it not to"
+    else
+      SIGNING_STATE="UNSIGNED — this kernel ($SB_WHY) will refuse them at boot"
+      SIGN_FAIL=1
+      bad "the modules installed above are UNSIGNED and this kernel refuses unsigned modules ($SB_WHY) — after the reboot every one of them fails to load with 'Key was rejected by service', so this install is on disk but NOT in effect"
+      printf '        %s\n' "first unsigned: ${SB_UNSIGNED[0]}"
+      action "sign these modules and enrol the key: set up DKMS module signing (sign_tool or mok_signing_key in /etc/dkms/framework.conf) and re-run, then 'sudo mokutil --import' the certificate and enrol it at the next boot. Or turn Secure Boot off in firmware. Or re-run with --mok-enrolled if you sign them yourself"
+    fi
+  else
+    for s in "${!SB_SIGNERS[@]}"; do key_trusted "$s" || SB_UNTRUSTED+=("$s"); done
+    if [[ ${#SB_UNTRUSTED[@]} -eq 0 ]]; then
+      SIGNING_STATE="ok — signed, and this machine trusts the key"
+      ok "this kernel refuses unsigned modules ($SB_WHY), and every module installed above is signed by a key this machine already trusts (${!SB_SIGNERS[*]})"
+    else
+      SIGNING_STATE="signed, but the key was not found in this machine's trusted keys"
+      warn "every module installed above IS signed (${SB_UNTRUSTED[*]}), but this run could not find that key in mokutil --list-enrolled or /proc/keys — that is not proof it is untrusted, only that it could not be proved trusted"
+      action "if the camera is still dead after the reboot, check 'sudo dmesg | grep -i \"key was rejected\"' — if that fires, enrol your signing certificate with 'sudo mokutil --import <cert>' and reboot"
+    fi
+  fi
+fi
+fi
+
+# ---------------------------------------------------------------------------
 if [[ $DO_HOWDY -eq 1 ]]; then
 say "Howdy IR integration"
 # Howdy's recorders directory moves between versions and packagings. Asserting
@@ -1260,6 +1436,10 @@ if [[ $DO_KERNEL -eq 1 ]]; then
   fi
   printf '    %-17s : %s\n' "initramfs" "$INITRAMFS_STATE"
   printf '    %-17s : %s\n' "secure boot" "$SECUREBOOT"
+  # Separate from "secure boot" on purpose. Secure Boot being ENABLED says
+  # nothing on its own -- plenty of kernels boot with it on and load unsigned
+  # modules anyway. This line is the one that answers "will they load".
+  printf '    %-17s : %s\n' "module signing" "$SIGNING_STATE"
 fi
 if [[ $UDEV_FAIL -gt 0 ]]; then
   printf '    %-17s : %d failed\n' "udev rules" "$UDEV_FAIL"
@@ -1337,6 +1517,17 @@ if [[ $DO_KERNEL -eq 1 ]]; then
       RC=1
       ;;
   esac
+  # Modules the kernel will refuse are not installed modules. Everything above
+  # can be green and this still has to fail, because after the reboot the
+  # machine is byte-for-byte as unhelpful as it was before the run.
+  if [[ $SIGN_FAIL -eq 1 ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+      bad "a real run would install modules this kernel refuses to load — fix the signing problem above first."
+    else
+      bad "the modules will not load on the next boot — this install is on disk but NOT in effect. Do not reboot expecting a working camera."
+    fi
+    RC=1
+  fi
 fi
 if [[ $UDEV_FAIL -gt 0 ]]; then
   bad "${UDEV_FAIL} udev rule(s) were not installed — the IR illuminator stays root-only (Howdy times out) and/or the bridge keeps autosuspending."
@@ -1395,17 +1586,28 @@ EOF
   # Only claim the initramfs was rebuilt if it actually was. Telling someone
   # their initramfs is current when it is not sends them hunting a hardware
   # fault while the kernel quietly loads last week's module.
+  # Only claim the initramfs is current when it is. The NOT-regenerated case is
+  # deliberately NOT printed here -- it is the last thing on the screen instead
+  # (see the end of this file), because a warning in the middle of a success
+  # screen is a warning nobody reads.
   case $INITRAMFS_STATE in
     regenerated*)
       echo "    The initramfs was regenerated above, so the rebooted kernel loads what"
       echo "    was just built rather than the copy it already had." ;;
-    *)
-      echo "    The initramfs was NOT regenerated ($INITRAMFS_STATE) — rebuild it before"
-      echo "    rebooting, or the kernel may keep loading the modules it already has." ;;
   esac
   if [[ $SECUREBOOT == ENABLED ]]; then
-    echo "    Secure Boot is ENABLED: until your DKMS signing key is enrolled with"
-    echo "    mokutil, the kernel will refuse to load every module installed above."
+    case $SIGNING_STATE in
+      ok*)
+        echo "    Secure Boot is ENABLED and every module above is signed by a key this"
+        echo "    machine trusts, so the kernel will accept them." ;;
+      "not enforced"*)
+        echo "    Secure Boot is ENABLED, but this kernel does not enforce module"
+        echo "    signatures, so the modules above load unsigned." ;;
+      *)
+        echo "    Secure Boot is ENABLED and this run could not prove the kernel will"
+        echo "    accept these modules. If the camera is still dead after the reboot,"
+        echo "    run: sudo dmesg | grep -i 'key was rejected'" ;;
+    esac
   fi
   printf '\n    After rebooting:\n'
   printf '      sudo %s/tools/verify.sh          check the whole stack\n' "$HERE"
@@ -1423,5 +1625,25 @@ else
     printf '      sudo howdy -U $USER add       enrol a face model\n'
     printf '      sudo howdy test               watch the IR frames\n'
   fi
+fi
+
+# LAST, deliberately, and after everything else on the screen. Reaching this
+# point with an un-regenerated initramfs means --no-initramfs was given: the
+# user opted out explicitly and was told what they now owe, so it stays exit 0
+# (it is the one documented way to finish successfully without one). What it
+# must not be is a line in the middle of a success screen, which is where it
+# used to sit -- five lines above a list of commands, in the place people skip.
+if [[ $DO_KERNEL -eq 1 ]]; then
+  case $INITRAMFS_STATE in
+    regenerated*) ;;
+    *)
+      printf '\n    \033[1;33mBEFORE YOU REBOOT\033[0m\n'
+      printf '    The initramfs was NOT regenerated (%s).\n' "$INITRAMFS_STATE"
+      printf '    Run this first:\n'
+      printf '        sudo %s\n' "${INITRAMFS_CMD:-<the initramfs command for your distro>}"
+      printf '    Until you do, the kernel can keep loading the modules it already had,\n'
+      printf '    and this install will look like it changed nothing.\n'
+      ;;
+  esac
 fi
 exit 0
