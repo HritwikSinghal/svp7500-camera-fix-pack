@@ -1183,10 +1183,34 @@ if [[ $PSYS_TREE_OK -eq 1 ]]; then
     PATCH_FAIL=$((PATCH_FAIL+1))
     bad "cannot write a backup of $PSYSC — refusing to run the defer fix against a vendor tree with no way back"
     action "check permissions/space on $IPUSRC, then re-run"
+  elif [[ ${WANT_DEFER_FIX:-0} -ne 1 ]]; then
+    # NOT applied by default any more. Measured on 2026-07-27:
+    #
+    #   this machine, 7.2.0-rc4, ipu7-drivers r74, WITHOUT the skip:
+    #     /dev/ipu7-psys0 present, "IPU psys probe done." -- the skip was never
+    #     needed here, and had been shipped to everyone as a workaround for a
+    #     problem that was never confirmed on the machine it was written on.
+    #
+    #   a reporter's machine, 7.1.4, same r74, WITH the skip:
+    #     "psys device_register failed", probe fails -22. Removing the skip made
+    #     that error disappear. The skip did not fix their defer, it converted a
+    #     hang into a crash.
+    #
+    # The check it removes exists to make psys wait for intel_ipu7. Skipping it
+    # unconditionally means psys can probe too early, which is exactly what
+    # device_register was complaining about. If psys really does defer forever on
+    # some machine, the answer is to find out why that flag reads false there,
+    # not to stop reading it.
+    #
+    # Still available deliberately, for anyone who has established they need it:
+    #   sudo WANT_DEFER_FIX=1 ./install.sh
+    skip_step "psys defer fix NOT applied (default since v1.1 — it is unnecessary on tested hardware and caused a probe failure on another machine; set WANT_DEFER_FIX=1 if you have established you need it)"
+    rm -f "$SNAP2"
   elif DERR=$(bash "$DEFERFIX" "$IPUSRC" 2>&1); then
     PATCH_OK=$((PATCH_OK+1))
     if cmp -s "$SNAP2" "$PSYSC"; then rm -f "$SNAP2"; else PSYS_SNAPS+=("$SNAP2"); fi
-    ok "psys defer check neutralised"
+    ok "psys defer check neutralised (WANT_DEFER_FIX=1)"
+    warn "this is off by default: it is unnecessary on tested hardware and caused 'psys device_register failed' (-22) on another machine"
   else
     PATCH_FAIL=$((PATCH_FAIL+1))
     bad "psys defer fix did not apply to $PSYSC — it said:"
