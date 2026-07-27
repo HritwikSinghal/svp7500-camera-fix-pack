@@ -743,26 +743,19 @@ install_module(){
     return 0
   fi
 
-  # Match the build recipe to the kernel's compiler. The shipped dkms.conf
-  # hardcodes clang/LLVM; on a GCC kernel those flags make every build fail, and
-  # dkms buries the reason in a log nobody reads. Strip them for GCC, re-add the
-  # right set for clang. Rewrite the COPY in /usr/src, never the packaged source,
-  # so re-running with a different kernel cannot compound the edit.
-  if [[ $DRY_RUN -eq 1 ]]; then
-    [[ $KCC = gcc ]] && plan "would rewrite $dst/dkms.conf for a gcc kernel (drop CC=clang LD=ld.lld LLVM=1)"
-  elif [[ -f $dst/dkms.conf ]]; then
-    sed -i -e 's| CC=clang LD=ld\.lld LLVM=1||g' -e 's| CC=clang LLVM=1||g' "$dst/dkms.conf"
-    if [[ -n $CC_FLAGS ]]; then
-      sed -i -e "s| modules\"| $CC_FLAGS modules\"|g" -e "s| clean\"| $CC_FLAGS clean\"|g" "$dst/dkms.conf"
-    fi
-    # Prove it rather than assume it: a silent no-op sed here produces a build
-    # failure a hundred lines later with no hint of the cause.
-    if [[ $KCC = gcc ]] && grep -q 'CC=clang' "$dst/dkms.conf"; then
-      bad "$m: dkms.conf still specifies clang on a gcc kernel — the build will fail"
-      count_module_failure "$m" "$kind"
-      return 0
-    fi
-  fi
+  # NOTE: this deliberately does NOT rewrite dkms.conf for the kernel's compiler.
+  # The shipped dkms.conf files decide that themselves -- they are sourced by dkms
+  # as shell and read CONFIG_CC_IS_CLANG from ${kernelver}'s own .config. That is
+  # strictly better than rewriting here, because it also covers the two paths this
+  # installer never sees: AUTOINSTALL rebuilding on a kernel upgrade, and the AUR
+  # package installing those files directly. It is also the only approach that can
+  # be right on a machine with one clang kernel and one gcc kernel, where a single
+  # install-time rewrite must pick one answer for both.
+  #
+  # An earlier version of this fix did rewrite them, and then verified by grepping
+  # for CC=clang -- which matches the conditional INSIDE the compiler-aware
+  # dkms.conf and made the installer reject a file that was correct. Caught by the
+  # gcc-kernel scenario in tools/behaviour-test.sh.
 
   # Register the tree with DKMS -- WITHOUT tearing down what is installed now.
   #

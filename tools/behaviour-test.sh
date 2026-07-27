@@ -130,6 +130,7 @@ declare -a SCENARIOS=(
   running-kernel-no-build-tree
   running-kernel-no-build-tree-force
   mkinitcpio-fails
+  gcc-kernel
   dkms-all-builds-fail
   dkms-fails-for-one-kernel
   nothing-installed-nothing-built
@@ -167,6 +168,7 @@ declare -A RULE=(
   [running-kernel-no-build-tree]="no headers for the kernel you are ON: refuse and name that kernel"
   [running-kernel-no-build-tree-force]="--force past it still fails: the reboot would change nothing"
   [mkinitcpio-fails]="initramfs generator exits 1: the install is NOT in effect, so neither is exit 0"
+  [gcc-kernel]="a gcc-built kernel: detect it, do NOT demand clang, and strip the clang flags from every dkms.conf"
   [dkms-all-builds-fail]="nothing built anywhere: NOTHING WAS INSTALLED, never Done, and the count line says 0"
   [dkms-fails-for-one-kernel]="built for A, failed for B: fail, name B, and count B's modules as 0 (ONLY the per-kernel verdict can fire here)"
   [nothing-installed-nothing-built]="every module blocked before its first build: zero-modules is the ONLY verdict that can fire"
@@ -777,6 +779,12 @@ build_world(){ # $1 = sandbox dir
     mkdir -p "$sb/root/lib-modules/$k/build" "$sb/root/lib-modules/$k/kernel"
     : >"$sb/root/lib-modules/$k/modules.builtin"
     : >"$sb/root/lib-modules/$k/modules.dep"
+    # install.sh reads CONFIG_CC_IS_CLANG from the target kernel's own .config
+    # to decide which compiler to build with. Without a .config here every
+    # scenario silently exercised the gcc fallback, so the clang path -- the one
+    # the author's machine uses -- was never covered, and neither was the gcc
+    # rewrite. Default to clang; world_gcc_kernel overrides it.
+    printf 'CONFIG_CC_IS_CLANG=y\n' >"$sb/root/lib-modules/$k/build/.config"
   done
 
   # An ipu7-drivers tree that DKMS "has installed", with the real defer check in
@@ -881,6 +889,18 @@ world_running_kernel_no_build_tree_force(){
   setargs --force
 }
 world_mkinitcpio_fails(){ setenv BT_MKINITCPIO_RC 1; }
+# The regression this exists to prevent: the dkms.conf files hardcode
+# CC=clang LD=ld.lld LLVM=1, and clang refuses gcc's flags. install.sh has to
+# detect the kernel's compiler and rewrite them. That logic was added in v0.5,
+# survived 74 days, and was deleted by a wholesale file copy from a CachyOS-only
+# tree -- breaking vanilla Arch, Fedora, Debian and Ubuntu. Nothing caught it;
+# a user found it by reading the diff (issue #3).
+world_gcc_kernel(){
+  for k in "$KA" "$KB"; do
+    printf 'CONFIG_CC_IS_GCC=y\n# CONFIG_CC_IS_CLANG is not set\n' \
+      >"$SB/root/lib-modules/$k/build/.config"
+  done
+}
 
 # --- isolation helpers ------------------------------------------------------
 # A machine that never installed intel-ipu7-dkms-git: no ipu7-drivers source
@@ -1109,6 +1129,42 @@ assert_running_kernel_no_build_tree_force(){
   expect_say 'rebooting into it changes NOTHING' "what the reboot would achieve"
   expect_silent '==> Done' "Done"
 }
+assert_gcc_kernel(){
+  # A gcc kernel must install cleanly WITHOUT the LLVM toolchain being demanded,
+  # and every installed dkms.conf must have the clang flags stripped -- otherwise
+  # dkms builds with a compiler the kernel did not use and every module fails,
+  # with the reason buried in a build log.
+  expect_rc 0
+  expect_say 'kernel compiler: gcc' "which compiler it detected"
+  expect_silent 'is not installed .*clang' "a demand for clang on a gcc kernel"
+
+  # Do NOT grep the installed dkms.conf for the literal 'CC=clang': it appears
+  # legitimately inside the conditional that chooses the compiler, so the string
+  # being present proves nothing. Evaluate the file the way dkms does -- source
+  # it with kernelver set to the gcc kernel -- and check what it actually
+  # resolves to. Grepping for the string was the first version of this check and
+  # it rejected a dkms.conf that was correct.
+  local bad_confs=0 f
+  for f in "$SB"/root/usr-src/*/dkms.conf; do
+    [ -f "$f" ] || continue
+    local got
+    got=$(kernelver="$KA" kernel_source_dir=/lib/modules/$KA/build dkms_tree=/var/lib/dkms \
+          bash -c 'source "$1" >/dev/null 2>&1; printf "%s" "${MAKE[0]}"' _ "$f" 2>/dev/null)
+    case $got in
+      *CC=clang*) bad_confs=$((bad_confs+1)) ;;
+    esac
+  done
+  if [ "$bad_confs" -ne 0 ]; then
+    # fail() only prints; the caller owns the counter. Without this the scenario
+    # goes red on screen and green in the exit code -- the same defect this whole
+    # suite exists to catch.
+    fail "$bad_confs dkms.conf file(s) still resolve to a clang build line on a gcc kernel — every build would fail"
+    SC_FAILS=$((SC_FAILS+1))
+  else
+    pass "every dkms.conf resolves to a gcc build line on a gcc kernel"
+  fi
+}
+
 assert_mkinitcpio_fails(){
   expect_rc_not 0
   expect_logged 'mkinitcpio -P' "mkinitcpio -P"
