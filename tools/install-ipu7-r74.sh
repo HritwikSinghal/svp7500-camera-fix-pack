@@ -33,9 +33,19 @@
 #   Split provenance like that is the trigger.
 #
 # WHAT THIS DOES
-#   Builds ipu7-drivers at commit 24d8923 (r74) for every installed kernel,
-#   re-applies the psys patches this pack needs, and pins the package so the
-#   next -Syu does not undo it. It does NOT reboot.
+#   Builds ipu7-drivers at commit 24d8923 (r74) for every installed kernel and
+#   re-applies the psys patches this pack needs. It proves each build from the
+#   .ko on disk, not from dkms's exit code. It does NOT reboot.
+#
+#   It does NOT edit /etc/pacman.conf: it CHECKS whether the package is pinned
+#   and prints the IgnorePkg line to add if it is not. The header used to say it
+#   pinned the package, which it never did -- so a user who read that and did
+#   not read the output was one -Syu away from the broken revision returning.
+#
+# Exit status: 0 every kernel got a psys module on disk AND the patches are in
+#                the source that built them,
+#              1 something above did not happen (it is named),
+#              2 bad usage.
 # ===========================================================================
 set -euo pipefail
 
@@ -53,16 +63,36 @@ for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
     --check)   CHECK=1 ;;
-    -h|--help) sed -n '2,46p' "$0"; exit 0 ;;
+    # Print the file's own header rather than a hardcoded line range: '2,46p'
+    # silently truncated the moment the header grew, so --help stopped showing
+    # the exit-status contract it had just gained.
+    -h|--help) awk 'NR>2 { if (/^# ={10,}$/) exit; sub(/^# ?/,""); print }' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
 
+# Counted, not narrated. A patch that did not apply and a module that is not on
+# disk both have to be able to reach the exit status; a `warn` cannot.
+PATCH_FAIL=0
+NOKO=0
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '    \033[33m!\033[0m %s\n' "$*"; }
 bad()  { printf '    \033[31m✗\033[0m %s\n' "$*"; }
 run()  { if [[ $DRY -eq 1 ]]; then printf '    would run: %s\n' "$*"; else "$@"; fi; }
+
+# Did a module actually land for this kernel? Out-of-tree destinations only --
+# finding the kernel's own copy would make a failed build look like a success.
+ko_landed(){
+  local k=$1 n=$2 d
+  for d in updates extra weak-updates; do
+    [[ -d /lib/modules/$k/$d ]] || continue
+    find "/lib/modules/$k/$d" -type f \( -name "${n}.ko" -o -name "${n}.ko.*" \
+         -o -name "${n//-/_}.ko" -o -name "${n//-/_}.ko.*" \) 2>/dev/null \
+      | grep -q . && return 0
+  done
+  return 1
+}
 
 # --- what do we have now? ----------------------------------------------------
 say "Current state"
@@ -105,7 +135,16 @@ else
   # dkms matches the directory name against PACKAGE_VERSION; a mismatch makes
   # `dkms add` succeed and every later command silently address a different tree.
   run sed -i "s/^PACKAGE_VERSION=\".*\"$/PACKAGE_VERSION=\"$R74_VER\"/" "$SRC/dkms.conf"
-  ok "installed source at $SRC"
+  # Only claim it after looking. This printed a green "installed source at ..."
+  # during --dry-run, for a clone that had not happened.
+  if [[ $DRY -eq 1 ]]; then
+    printf '    would install the source at %s\n' "$SRC"
+  elif [[ -f $SRC/dkms.conf ]]; then
+    ok "installed source at $SRC"
+  else
+    bad "the source was NOT written to $SRC (no dkms.conf there) — nothing below can build"
+    exit 1
+  fi
 fi
 
 # --- patches -----------------------------------------------------------------
@@ -118,8 +157,17 @@ else
       printf '    would apply: psys-suspend-BC.patch\n'
     elif patch -p1 -d "$SRC" --forward --silent < "$PATCHDIR/psys-suspend-BC.patch" 2>/dev/null; then
       ok "suspend patches applied"
-    else
+    # `patch --forward` exits non-zero for "already applied" AND for "does not
+    # apply at all", and this used to print a green "already applied" for both.
+    # A patch that never went anywhere near the source came out as a ✓. Ask the
+    # source itself: if the patch reverses cleanly, it is in there.
+    elif patch -p1 -d "$SRC" --reverse --dry-run --silent \
+           < "$PATCHDIR/psys-suspend-BC.patch" >/dev/null 2>&1; then
       ok "suspend patches already applied"
+    else
+      PATCH_FAIL=$((PATCH_FAIL+1))
+      bad "psys-suspend-BC.patch does NOT apply to $SRC and is NOT already in it"
+      echo "       s2idle suspend will oops this psys build; the revision may have moved"
     fi
   fi
   if [[ -f $PATCHDIR/fix-psys-defer.sh ]]; then
@@ -129,10 +177,18 @@ else
     # happen is the exact defect this project keeps shipping.
     if [[ $DRY -eq 1 ]]; then
       printf '    would run: fix-psys-defer.sh %s\n' "$SRC"
-    elif bash "$PATCHDIR/fix-psys-defer.sh" "$SRC" >/dev/null 2>&1; then
+    elif DERR=$(bash "$PATCHDIR/fix-psys-defer.sh" "$SRC" 2>&1); then
       ok "defer check neutralised"
     else
-      warn "defer fix did not apply — check /dev/ipu7-psys0 after rebooting"
+      # This is the whole reason /dev/ipu7-psys0 appears. Downgrading it to a
+      # warning meant the run went on to print "N kernel(s) built at r74" and
+      # exit 0 while shipping a psys that defers forever -- the exact camera
+      # this script exists to bring back.
+      PATCH_FAIL=$((PATCH_FAIL+1))
+      bad "the defer fix did NOT apply to $SRC — it said:"
+      printf '%s\n' "$DERR" | sed 's/^/          /'
+      echo "       without it psys reads ipu7_bus_ready_to_probe at the wrong offset"
+      echo "       and defers forever: /dev/ipu7-psys0 will not appear after the reboot"
     fi
   fi
 fi
@@ -152,7 +208,21 @@ for k in $(ls /lib/modules); do
     printf '    would build for: %s\n' "$k"; BUILT=$((BUILT+1)); continue
   fi
   if dkms install "ipu7-drivers/$R74_VER" -k "$k" >/dev/null 2>&1; then
-    ok "$k"; BUILT=$((BUILT+1))
+    # dkms's exit code is not evidence. Prove the psys module from disk, using
+    # the names the vendor tree's own dkms.conf promises -- this whole package
+    # exists because "dkms said yes" was once allowed to mean "installed".
+    miss=()
+    mapfile -t names < <(sed -n 's/^BUILT_MODULE_NAME\[[0-9]*\]="\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' "$SRC/dkms.conf")
+    [[ ${#names[@]} -gt 0 ]] || names=(intel-ipu7-psys)
+    for n in "${names[@]}"; do
+      ko_landed "$k" "$n" || miss+=("$n")
+    done
+    if [[ ${#miss[@]} -eq 0 ]]; then
+      ok "$k  (verified on disk: ${names[*]})"; BUILT=$((BUILT+1))
+    else
+      bad "$k — dkms reported success but ${miss[*]} is not under /lib/modules/$k/{updates,extra,weak-updates}"
+      NOKO=$((NOKO+1)); FAILED=$((FAILED+1))
+    fi
   else
     bad "$k — FAILED"; FAILED=$((FAILED+1))
   fi
@@ -184,10 +254,22 @@ if [[ $BUILT -eq 0 ]]; then
   exit 1
 fi
 if [[ $FAILED -gt 0 ]]; then
-  bad "$FAILED kernel(s) failed to build; booting those leaves the camera broken"
+  if [[ $NOKO -gt 0 ]]; then
+    bad "$FAILED kernel(s) did not end up with a psys module on disk; booting those leaves the camera broken"
+  else
+    bad "$FAILED kernel(s) failed to build; booting those leaves the camera broken"
+  fi
   exit 1
 fi
-ok "$BUILT kernel(s) built at $R74_VER"
+# Everything can build and the camera still not come back: the defer fix is what
+# makes /dev/ipu7-psys0 appear at all. It may not ride out on the build count.
+if [[ $PATCH_FAIL -gt 0 ]]; then
+  bad "$BUILT kernel(s) built, but $PATCH_FAIL psys patch(es) are NOT in that source"
+  echo "       so this is r74 WITHOUT the fixes that make it work. Do not reboot"
+  echo "       expecting a camera: fix what is reported above and re-run."
+  exit 1
+fi
+ok "$BUILT kernel(s) built at $R74_VER, psys patches present in the source"
 cat <<'EOF'
 
     REBOOT to load it. Do not modprobe -r intel_ipu7_psys to pick it up live —

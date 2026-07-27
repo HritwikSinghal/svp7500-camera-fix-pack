@@ -131,21 +131,40 @@ if [ ! -e "$DRV/$SENSOR" ]; then
     echo "$SENSOR" > "$DRV/bind" 2>/dev/null || true
 fi
 if [ -e "$DRV/$SENSOR" ]; then
-    echo "ov05c10 bound — camera recovered"
+    # "camera recovered" was a claim about something this script never checked:
+    # binding the sensor driver is not a frame. Say what was observed.
+    echo "ov05c10 bound to $SENSOR (isys re-binds the subdev from here)"
+    echo "  this confirms the driver attached, not that a frame arrives —"
+    echo "  check that with: sudo tools/verify.sh"
 else
     echo "FAILED: single bind attempt did not stick — DO NOT retry the bind."
     echo "Rerun this script (fresh port power-cycle) or reboot. Check dmesg."
     exit 1
 fi
 
-# IR sensor: best effort (non-streaming anyway, keeps boot parity)
-echo i2c-HIMX1092:00 > /sys/bus/i2c/drivers/hm1092/bind 2>/dev/null || true
+RC=0
+
+# IR sensor: best effort (non-streaming anyway, keeps boot parity). Best effort
+# still gets reported -- a bind nobody looked at is not a bind.
+if [ -e /sys/bus/i2c/drivers/hm1092 ]; then
+    echo i2c-HIMX1092:00 > /sys/bus/i2c/drivers/hm1092/bind 2>/dev/null || true
+    if [ -e /sys/bus/i2c/drivers/hm1092/i2c-HIMX1092:00 ]; then
+        echo "hm1092 re-bound as well"
+    else
+        echo "note: hm1092 did not re-bind (the IR sensor does not stream anyway;"
+        echo "      it re-binds at the next boot)"
+    fi
+fi
 
 if [ "$RELAY_WAS_ACTIVE" = 1 ]; then
     if systemctl start "$RELAY"; then
         echo "restarted $RELAY"
     else
-        echo "WARNING: could not restart $RELAY — start it yourself: systemctl start $RELAY"
+        # This script stopped it. Leaving it stopped is a thing that did not get
+        # put back, so it may not exit 0.
+        echo "FAILED: could not restart $RELAY, and this script is what stopped it."
+        echo "        Start it yourself: systemctl start $RELAY"
+        RC=1
     fi
 fi
 
@@ -153,6 +172,14 @@ fi
 # no sysfs attribute to check. So this cannot claim the LED went out, only that
 # the thing that clears it was done. Saying "LED OFF" as a fact was a claim
 # about something this script never looked at.
+if [ "$RC" -ne 0 ]; then
+    echo
+    echo "NOT done: see the FAILED line above. The bridge was power-cycled, but"
+    echo "something this script stopped was not started again."
+    exit "$RC"
+fi
+
 echo "Done: the bridge was power-cycled and ov05c10 re-bound."
 echo "Look at the LED. It should now be off until the next camera stream."
 echo "If it is still lit, the power-cycle did not reach the bridge — reboot."
+exit 0

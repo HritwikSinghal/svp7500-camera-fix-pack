@@ -552,7 +552,13 @@ for conf in "$ROOT"/dkms/*/dkms.conf; do
   if [[ -z $mkline ]]; then
     warn "$(rel "$conf"): no MAKE[0] — dkms falls back to its own default build command"
   else
-    if grep -q 'CC=clang' <<<"$mkline"; then CLANG_YES+=("$b"); else CLANG_NO+=("$b"); fi
+    # An intentional exception has to be written down in the dkms.conf, not
+    # inferred from a warning nobody reads. `# TOOLCHAIN: <reason>` in the conf
+    # is how a tree says "yes, I really do build differently".
+    if grep -q 'CC=clang' <<<"$mkline"; then CLANG_YES+=("$b")
+    elif grep -qE '^[[:space:]]*#[[:space:]]*TOOLCHAIN:' "$conf"; then
+      pass "$(rel "$conf"): builds without CC=clang, and says why in a '# TOOLCHAIN:' comment"
+    else CLANG_NO+=("$b"); fi
     grep -qE '[$]\{?kernel_source_dir\}?' <<<"$mkline" \
       || fail "$(rel "$conf"): MAKE[0] never mentions kernel_source_dir" \
               "dkms would build against whatever kernel make picks, not the one being installed for"
@@ -602,11 +608,18 @@ done
 
 # These trees are built with clang against clang-built kernels. One conf losing
 # CC=clang while its siblings keep it builds that module with a different
-# toolchain than the kernel it loads into -- which surfaces as a load failure,
+# toolchain than the kernel it loads into -- which surfaces as a LOAD failure,
 # not a build failure, long after the installer said Done.
+#
+# This was a warn(). The file's own header says a warning CI ignores is how the
+# verify.sh split shipped, and a symptom that appears after "Done" is exactly
+# what this suite is for, so it fails. The written-down escape hatch is a
+# `# TOOLCHAIN: <reason>` comment in the odd conf (handled above).
 if [[ ${#CLANG_YES[@]} -gt 0 && ${#CLANG_NO[@]} -gt 0 ]]; then
-  warn "MAKE[0] toolchain is inconsistent: ${CLANG_NO[*]} build without CC=clang, ${CLANG_YES[*]} with it" \
-       "if that is deliberate, say so in the dkms.conf; if not, the odd one out will not load"
+  fail "MAKE[0] toolchain is inconsistent: ${CLANG_NO[*]} build without CC=clang, ${CLANG_YES[*]} with it" \
+       "the odd one out is compiled by a different toolchain than the kernel it loads into," \
+       "which shows up as a LOAD failure long after the installer reported success" \
+       "if it really is deliberate, put a '# TOOLCHAIN: <reason>' line in ${CLANG_NO[0]}'s dkms.conf"
 elif [[ ${#CLANG_YES[@]} -gt 0 ]]; then
   pass "all ${#CLANG_YES[@]} dkms.conf MAKE[0] lines use the same toolchain (CC=clang)"
 fi
