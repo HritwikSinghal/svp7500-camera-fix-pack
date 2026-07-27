@@ -195,9 +195,41 @@ else
     sub "   ships with the kernel, which makes the failure look selective."
     # Never print a Fix: line for a script whose precondition has not been met.
     if dkms status 2>/dev/null | grep -qE '^ipu7-drivers[/,]'; then
-      sub "   Fix: sudo $ROOT/dkms/ipu7-psys-patches/fix-psys-defer.sh"
-      sub "        (then rebuild for every kernel and reboot)"
-      next "run $ROOT/dkms/ipu7-psys-patches/fix-psys-defer.sh, rebuild ipu7-drivers for every kernel, reboot"
+      # Do NOT advise applying a fix that may already be applied. Telling
+      # someone to run fix-psys-defer.sh when their source already carries it
+      # sends them round the same loop with nothing to show for it, which is
+      # exactly what happened to a reporter for three rounds.
+      #
+      # The defer fix is `if (0) /* ... */` -- a compiler-removed branch, not a
+      # string. It CANNOT be detected in the built module by any means, so the
+      # source is the only place worth looking. The suspend patches add real
+      # dev_warn() string literals, so those ARE visible in the module, and the
+      # two together tell us which step is actually missing.
+      _iv=$(dkms status 2>/dev/null | sed -n 's|^ipu7-drivers/\([^,]*\),.*|\1|p' | sort -u | head -1)
+      _isrc=/usr/src/ipu7-drivers-$_iv/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
+      if [ ! -f "$_isrc" ]; then
+        sub "   the ipu7-drivers source for $_iv is not at $_isrc,"
+        sub "   so the patch state cannot be determined."
+        next "report this with 'dkms status' and 'ls /usr/src | grep ipu7'"
+      elif ! grep -q 'DKMS struct layout mismatch' "$_isrc"; then
+        sub "   the defer fix is NOT in your source. That is the thing to fix:"
+        sub "   Fix: sudo $ROOT/dkms/ipu7-psys-patches/fix-psys-defer.sh"
+        sub "        then rebuild for every kernel and reboot"
+        next "apply fix-psys-defer.sh, rebuild ipu7-drivers for every kernel, reboot"
+      elif [ "$(ko_cat "$PSYS_P" 2>/dev/null | grep -aoE 'psys not ready after resume|ioctl: resume failed' | sort -u | wc -l)" -lt 2 ]; then
+        sub "   your SOURCE is already patched, but the built module is not:"
+        sub "   the suspend patches are missing from it, so the source was"
+        sub "   patched after the last build, or the rebuild did not happen."
+        sub "   Fix: sudo dkms install --force ipu7-drivers/$_iv -k \$(uname -r)"
+        sub "        then reboot"
+        next "rebuild ipu7-drivers: sudo dkms install --force ipu7-drivers/$_iv -k \$(uname -r), then reboot"
+      else
+        sub "   NOTE: your source AND your built module already carry the"
+        sub "   patches, so the usual fix does not apply and re-running it will"
+        sub "   change nothing. psys is deferring for a different reason."
+        sub "   This is worth reporting rather than retrying."
+        next "the psys patches are already applied and built — do NOT re-run fix-psys-defer.sh; open an issue with this output plus: sudo dmesg | grep -iE 'ipu7|psys'"
+      fi
     else
       sub "   fix-psys-defer.sh cannot help here: it patches an ipu7-drivers"
       sub "   DKMS source tree, and 'dkms status' lists no ipu7-drivers. The"
