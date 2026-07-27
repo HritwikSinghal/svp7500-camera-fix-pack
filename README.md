@@ -18,9 +18,10 @@ cd svp7500-camera-fix-pack
 ./tools/check-hardware.sh
 ```
 
-Its last line is either `APPLIES TO THIS MACHINE: yes — ...` or
-`APPLIES TO THIS MACHINE: no — ...` with the reason. If it says no, stop:
-nothing here will help you, and `install.sh` will refuse to run anyway.
+It ends with a verdict line — `APPLIES TO THIS MACHINE: yes — ...` or
+`APPLIES TO THIS MACHINE: no — ...` with the reason — followed by what to do
+next. If it says no, stop: nothing here will help you, and `install.sh` will
+refuse to run anyway.
 
 > ### Testing scope — please read
 >
@@ -426,15 +427,30 @@ laptop.
 
 ## Recovery — if the camera does not come back
 
-**Nothing in this pack is in the boot path.** These are camera modules: `hm1092`,
-`intel_cvs`, `ipu-bridge`, `int3472`, `ov05c10`. A module that fails to build or
-load costs you a camera, not a bootable system. There is no scenario in which
-removing them is required to boot.
+**None of these modules is in the boot path.** They are camera modules:
+`hm1092`, `intel_cvs`, `ipu-bridge`, `int3472`, `ov05c10`. A module that fails
+to build or load costs you a camera, not a bootable system. There is no
+scenario in which removing them is required to boot.
 
-**Your other kernels keep working copies.** The installer builds per-kernel, and
-a failure on one kernel does not touch the modules already installed for another.
-If a specific kernel misbehaves, pick a different entry in your bootloader menu
-and you are back to a known state.
+The one thing the installer does touch that *is* in the boot path is the
+**initramfs**: it runs your distro's generator once at the end, because a DKMS
+rebuild alone leaves the kernel loading the copy already in there. That is an
+ordinary `mkinitcpio -P` / `dracut -f` / `update-initramfs -u` — the same
+command a kernel update runs — and if it fails the installer says so and exits
+non-zero rather than sending you to a reboot. `--no-initramfs` skips it
+entirely if you would rather sequence that yourself. Note that a Btrfs snapshot
+does **not** protect `/boot`; if you want a fallback there, keep a second
+kernel installed.
+
+**Your other kernels usually keep working copies.** The installer builds
+per-kernel with `dkms install --force`, so a failure on one kernel does not
+remove the module already installed for another, and picking a different
+bootloader entry gets you back to a known state. The exception is named on
+screen when it happens: if DKMS had the module registered against a *different*
+source tree, that registration has to be replaced, and doing so removes it for
+every kernel first. When a build then fails the installer says exactly that —
+`not installed for ANY kernel — and its previous registration had to be
+replaced` — rather than letting you believe the old copy survived.
 
 To back the whole thing out:
 
@@ -444,9 +460,13 @@ for m in intel-cvs hm1092 int3472-patched ipu-bridge-patched ov05c10; do
 done
 sudo rm -f /etc/udev/rules.d/99-svp7500-no-autosuspend.rules \
            /etc/udev/rules.d/99-hm1092-ir-led.rules
+# the staged sources, and the .bak the installer leaves beside each of them
 sudo rm -rf /usr/src/intel-cvs-1.0 /usr/src/hm1092-1.0 \
             /usr/src/int3472-patched-1.0 /usr/src/ipu-bridge-patched-1.0 \
-            /usr/src/ov05c10-1.0
+            /usr/src/ov05c10-1.0 \
+            /usr/src/intel-cvs-1.0.bak /usr/src/hm1092-1.0.bak \
+            /usr/src/int3472-patched-1.0.bak /usr/src/ipu-bridge-patched-1.0.bak \
+            /usr/src/ov05c10-1.0.bak
 sudo udevadm control --reload-rules
 sudo mkinitcpio -P      # or: dracut -f  /  update-initramfs -u
 sudo reboot

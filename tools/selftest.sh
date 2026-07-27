@@ -788,6 +788,42 @@ while read -r rb; do
   fi
 done < <(printf '%s\n' "${!IREF[@]}" | sort)
 
+# The check above is keyed by BASENAME, so it can only compare tools both files
+# happen to name. Point install.sh's last screen at a DIFFERENT tool that also
+# exists -- `sudo $HERE/tools/find-ir-node.sh   check the whole stack` -- and
+# verify.sh simply drops out of IREF, the loop never compares it, and nothing
+# else notices because the file it now names is really there. That is the same
+# divergence one step further along, and it passed.
+#
+# So compare the two INSTRUCTIONS directly: every tools/*.sh the README's
+# Verification section tells a user to run after the reboot must also be named
+# in install.sh's own "After rebooting:" block. The installer is the last thing
+# on screen; if it sends people somewhere the README does not, the README is
+# not the documentation of this installer.
+# Anchor on `say "Done"`, not on "After rebooting:": usage()'s footer contains
+# that phrase too, near the top of the file, so scanning from there swept in the
+# whole script and the mutation stayed green.
+IS_NEXT=$(awk '/^say "Done"/ || /==> Done/ {f=1} f' "$INSTALL" | grep -oE '[^ "]*tools/[A-Za-z0-9_-]+\.sh' | sed 's|.*tools/|tools/|' | sort -u)
+RM_VERIFY=$(awk '/^## Verification/{f=1;next} /^## /{f=0} f' "$README" | grep -oE '\./tools/[A-Za-z0-9_-]+\.sh' | sed 's|^\./||' | sort -u)
+if [[ -z $RM_VERIFY ]]; then
+  warn "the README's Verification section names no tools/*.sh to run" \
+       "if verification has moved, this check no longer guards anything"
+else
+  vmiss=""
+  while read -r v; do
+    [[ -n $v ]] || continue
+    grep -qxF "$v" <<<"$IS_NEXT" || vmiss="$vmiss $v"
+  done <<<"$RM_VERIFY"
+  if [[ -n $vmiss ]]; then
+    fail "install.sh's 'After rebooting:' block never names:$vmiss" \
+         "the README tells people to run it after this exact install, and the" \
+         "installer's own last screen sends them somewhere else" \
+         "install.sh names: $(tr '\n' ' ' <<<"$IS_NEXT")"
+  else
+    pass "install.sh's last screen names every verification tool the README does ($(tr '\n' ' ' <<<"$RM_VERIFY"))"
+  fi
+fi
+
 # ===========================================================================
 section "installer assets install.sh copies verbatim"
 # Payload, not code. If one is absent the installer skips a whole feature --
