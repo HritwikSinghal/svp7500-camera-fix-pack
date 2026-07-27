@@ -419,8 +419,39 @@ else
   # which is what the NEXT boot loads. It prints for a module that is not loaded
   # at all, and it printed "2/2" beside a MISSING /dev/ipu7-psys0 -- a green
   # number for a driver that never bound. Say which artefact was read.
+  # What the SOURCE says, so a mismatch can be named as a mismatch. Five separate
+  # failures on this project were all "the thing you fixed is not the thing that
+  # is running" -- a stale module, a stale initramfs, a stale copy in the search
+  # path, headers disagreeing with the running kernel, and a DKMS build that did
+  # not pick up its own source. Every one presented as something else. Comparing
+  # source against module is the check that catches the whole class.
+  _sv=$(dkms status 2>/dev/null | sed -n 's|^ipu7-drivers/\([^,]*\),.*|\1|p' | sort -u | head -1)
+  _ss=/usr/src/ipu7-drivers-$_sv/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
+  _sn=0
+  [ -f "$_ss" ] && _sn=$(grep -acE 'psys not ready after resume|ioctl: resume failed' "$_ss" 2>/dev/null)
+
   if [ "${n:-0}" -eq 2 ]; then
     p "psys suspend patches" "2/2 present in the module on disk"
+  elif [ -f "$_ss" ] && [ "${_sn:-0}" -gt 0 ]; then
+    # The source has them and the module does not. This is not "partly patched",
+    # it is a build that never ran -- and telling someone to re-apply patches
+    # here sends them round a loop with nothing left to apply, which is exactly
+    # what happened to a reporter for three rounds.
+    p "psys suspend patches" "$n/2 in the module, but PRESENT in the source"
+    sub "-> your source is patched and your module is not: the rebuild never"
+    sub "   happened, or DKMS built from somewhere other than $_ss"
+    sub "   Fix: sudo dkms install --force ipu7-drivers/$_sv -k \$(uname -r)"
+    sub "   Then check BEFORE rebooting — it takes seconds instead of a cycle:"
+    case "$PSYSKO" in
+      *.zst) _dc="zstd -dcq" ;;
+      *.xz)  _dc="xz -dc" ;;
+      *.gz)  _dc="gzip -dc" ;;
+      *)     _dc="cat" ;;
+    esac
+    sub "     sudo $_dc \"\$(modinfo -n intel_ipu7_psys)\" | grep -ac 'psys not ready after resume'"
+    sub "   If that still prints 0, DKMS is not building what you patched:"
+    sub "     ls -l /var/lib/dkms/ipu7-drivers/$_sv/source"
+    next "the psys source is patched but the built module is not — rebuild with 'sudo dkms install --force ipu7-drivers/$_sv -k \$(uname -r)', do NOT re-apply the patches"
   else
     p "psys suspend patches" "$n/2 in the module on disk — s2idle suspend is only partly patched"
     next "re-run install.sh: the s2idle suspend patch is not fully present in the psys module ($n of 2 markers)"
