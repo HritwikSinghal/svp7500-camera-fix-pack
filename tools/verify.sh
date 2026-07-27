@@ -522,11 +522,19 @@ if [ ${#UNTESTED[@]} -gt 0 ]; then
   exit 2
 fi
 
-if [ $HAS_IR -eq 1 ] && [ $IR_BROKEN -eq 0 ] && [ "$CAPTURE_RESULT" = ok ]; then
-  printf 'RESULT: OK — RGB camera working, IR camera streaming\n'
-elif [ $HAS_IR -eq 1 ]; then
-  printf 'RESULT: OK — RGB camera working, IR present\n'
-else
+if [ $HAS_IR -eq 0 ]; then
   printf 'RESULT: OK — RGB camera working, no IR sensor on this board\n'
+elif [ "$CAPTURE_RESULT" = ok ]; then
+  printf 'RESULT: OK — RGB camera working, IR camera streaming\n'
+else
+  # Unreachable today: every path that skips the capture records an UNTESTED
+  # entry and has already exited 2 above. It stays as a hard floor, because the
+  # branch it replaces said "RESULT: OK — RGB camera working, IR present" for
+  # exactly this state -- a pass built on the sensor merely EXISTING, which is
+  # not the same claim as the IR camera working. One future edit that skips the
+  # capture without recording why would have turned "never tested" into OK.
+  printf 'RESULT: UNDETERMINED — RGB camera working; the IR capture was skipped\n'
+  printf 'without recording why, so nothing here can say whether IR works.\n'
+  exit 2
 fi
 exit 0
