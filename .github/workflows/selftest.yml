@@ -1,0 +1,63 @@
+name: package selftest
+
+# Validate the package the way a STRANGER receives it, not the way it looks in
+# a maintainer's working tree.
+#
+# The bug this guards against shipped green: install.sh searched kernel/<name>/
+# for modules the package publishes as dkms/<name>-<version>/, skipped all four,
+# and still exited 0. It worked on nobody's machine, including the author's --
+# because the author never ran the installer, they had the modules already.
+#
+# So this runs on a fresh checkout with nothing installed, and again on the
+# archive git actually produces, where only committed and tracked content
+# exists. A file that lives solely in someone's working directory fails here.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fresh-checkout:
+    name: selftest on a clean checkout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tools/selftest.sh
+        run: ./tools/selftest.sh
+
+      # A check nobody has watched fail is not yet a check. --prove builds a
+      # throwaway package carrying the exact layout mismatch that shipped and
+      # asserts selftest rejects it -- and builds a correct one to prove it is
+      # not simply failing everything.
+      - name: prove the module check still fires
+        run: ./tools/selftest.sh --prove
+
+  release-archive:
+    name: selftest on the archive users download
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `git archive` produces the same content as GitHub's source tarball:
+      # tracked files only, with their recorded modes. Anything untracked, or
+      # executable only in a local working tree, disappears here -- which is
+      # precisely how "it works for me" becomes "it did nothing for you".
+      - name: unpack the tarball a user would get
+        run: |
+          mkdir -p /tmp/asif
+          git archive --format=tar HEAD | tar -x -C /tmp/asif
+          echo "--- what a user receives ---"
+          find /tmp/asif -maxdepth 2 -name '*.sh' -printf '%M %p\n' | sort
+
+      - name: tools/selftest.sh (unpacked archive)
+        working-directory: /tmp/asif
+        run: ./tools/selftest.sh
+
+      - name: install.sh --help must work from the archive
+        working-directory: /tmp/asif
+        run: ./install.sh --help
