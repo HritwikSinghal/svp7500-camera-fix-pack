@@ -338,6 +338,20 @@ EOF
   expect_fail "$d" "transcript line install.sh never prints" \
     "a fenced transcript quoting a line the installer cannot produce"
 
+  # 13. Case 11 again, with the escape hatch case 11 left open. Break the lookup
+  #     the same way AND hand it a local copy of the module name at the call
+  #     site, so the resolver is no longer recognised by the shape this script
+  #     looks for. That used to drop silently back to the pattern harvest --
+  #     which still resolves -- and print a green line per module plus "the
+  #     package is internally consistent" for an installer that finds nothing.
+  #     Not being able to run the lookup is now the failure it always was: the
+  #     question this section exists to answer went unanswered.
+  d=$(mutate lookup-hidden-from-the-checker)
+  sed -i 's|-f $d/dkms.conf ]]|-f $d/dkms.conf \&\& -f $d/Kbuild ]]|' "$d/install.sh"
+  sed -i 's|do find_src "\$m" |do _m=$m; find_src "$_m" |' "$d/install.sh"
+  expect_fail "$d" "module lookup was NOT run" \
+    "a broken lookup hidden behind a call site this script cannot recognise"
+
   exit $rc
 fi
 
@@ -515,20 +529,25 @@ build_lib(){ # <fn>... -> writes $LOOKUP_LIB, non-zero if it will not parse
 }
 call_resolver(){ HERE="$ROOT" bash "$LOOKUP_RUN" "$LOOKUP_LIB" "$1" "$2"; }
 
-FN_CALLABLE=0
+# Not being able to RUN the lookup is a failure of this check, not a footnote
+# on it. It used to WARN and carry on with the pattern harvest, and a mutant
+# showed what that buys: rename the resolver's argument at both call sites so
+# this file no longer recognises which function locates a module, break the
+# lookup in the same edit, and selftest printed five green module lines and
+# "PASS -- the package is internally consistent" for an installer that would
+# find nothing at all. The harvest cannot answer this question; when it is the
+# only thing left, the honest report is that the question went unanswered.
+FN_CALLABLE=0 FN_WHYNOT=""
 if [[ ${#RESOLVER_FNS[@]} -gt 0 && ${#ALL_M[@]} -gt 0 ]]; then
   if build_lib "${EXTRACT_FNS[@]}" || build_lib "${RESOLVER_FNS[@]}"; then
     call_resolver "${RESOLVER_FNS[0]}" "${ALL_M[0]}" >/dev/null 2>&1
     case $? in
-      97) warn "install.sh's ${RESOLVER_FNS[0]}() cannot be extracted and run (the copy will not parse)" \
-               "falling back to reading its search patterns — weaker: a lookup can grep clean and still find nothing" ;;
-      98) warn "install.sh's ${RESOLVER_FNS[0]}() was not defined by its own extracted body" \
-               "falling back to reading its search patterns — weaker: a lookup can grep clean and still find nothing" ;;
+      97) FN_WHYNOT="install.sh's ${RESOLVER_FNS[0]}() cannot be extracted and run (the copy will not parse)" ;;
+      98) FN_WHYNOT="install.sh's ${RESOLVER_FNS[0]}() was not defined by its own extracted body" ;;
       *)  FN_CALLABLE=1 ;;
     esac
   else
-    warn "cannot lift install.sh's module lookup out of the file to run it" \
-         "falling back to reading its search patterns — weaker: a lookup can grep clean and still find nothing"
+    FN_WHYNOT="cannot lift install.sh's module lookup out of the file to run it"
   fi
 fi
 
@@ -561,14 +580,21 @@ else
   else
     SEARCH_PATS=("${MOD_PATTERNS[@]}")
     if [[ ${#RESOLVER_FNS[@]} -eq 0 ]]; then
-      warn "cannot tell which function install.sh uses to locate a module" \
-           "expected a call whose success decides it: 'if s=\$(fn \"\$m\"); then' or 'fn \"\$m\" || skip'" \
-           "checking every \$HERE/...\$m path in the file instead — weaker: a diagnostic glob can vouch for a broken lookup"
+      FN_WHYNOT="cannot tell which function install.sh uses to locate a module — expected a call whose success decides it: 'if s=\$(fn \"\$m\"); then' or 'fn \"\$m\" || skip'"
     else
       warn "install.sh's module lookup ${RESOLVER_FNS[*]}() builds no \$HERE/...\$m path this check can read" \
            "checking every \$HERE/...\$m path in the file instead — weaker: a diagnostic glob can vouch for a broken lookup"
     fi
     info "installer searches: ${SEARCH_PATS[*]}"
+  fi
+  # The one question this section exists to answer is "can install.sh find the
+  # module", and only install.sh's own lookup can answer it. If that lookup did
+  # not run, the answer is unknown -- and unknown is not a pass.
+  if [[ $FN_CALLABLE -eq 0 ]]; then
+    fail "install.sh's own module lookup was NOT run — this check did not verify that the installer can find anything" \
+         "${FN_WHYNOT:-the lookup could not be identified or lifted out of install.sh}" \
+         "the \$HERE/...\$m patterns were read instead, and a pattern that resolves cannot vouch for a function that does not" \
+         "restore a lookup this file can identify and run, or teach it the new shape — leaving the question unanswered is not a pass"
   fi
   LOOKUP_BROKEN=0
   for m in "${ALL_M[@]}"; do
@@ -633,7 +659,9 @@ else
              "shipped:  ${shipped:-(nothing matching)}"
       fi
     elif [[ -n $found ]]; then
-      pass "$m -> $(rel "$found")/dkms.conf  (by pattern only — the lookup itself could not be run)"
+      # Not a PASS: the pattern resolved, the function was never asked. Saying
+      # PASS here is how a dead lookup gets a green line next to its name.
+      warn "$m -> $(rel "$found")/dkms.conf  (by pattern only — install.sh's own lookup was NOT run, so this is unverified)"
     elif [[ $optional -eq 1 && $unshipped -eq 1 ]]; then
       warn "optional module '$m' is named by install.sh but not shipped at all" \
            "boards that need it get nothing; install.sh will skip it by design"
