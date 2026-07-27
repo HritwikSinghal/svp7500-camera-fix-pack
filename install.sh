@@ -278,11 +278,34 @@ if [[ $DO_KERNEL -eq 1 ]]; then
 fi
 [[ $DO_HOWDY -eq 1 ]] && need_tool patch "install the 'patch' package"
 
-# The dkms.conf files build with clang/LLVM. Without it every single module
-# fails, and dkms's own message is buried in a build log the user never sees.
-# Read the requirement out of the shipped dkms.conf rather than hardcoding it,
-# so this check stays true if the build recipe changes.
-if [[ $DO_KERNEL -eq 1 && ${#SRC_OF[@]} -gt 0 ]]; then
+# A module must be built with the SAME compiler as the kernel it loads into.
+# The shipped dkms.conf files hardcode clang/LLVM because that is what CachyOS
+# uses, but vanilla Arch, Fedora, Debian and Ubuntu kernels are GCC-built, and
+# clang refuses their flags (-mpreferred-stack-boundary, -mindirect-branch=...).
+#
+# So detect what the kernel was actually built with, and rewrite each dkms.conf
+# at install time to match. Reported as issue #3 by twouters: commit c9f4cbe
+# replaced this logic with a check that merely demanded clang be INSTALLED,
+# which turned every GCC-kernel distro into either a hard preflight failure or a
+# build using the wrong compiler -- i.e. most of the distros the README invites
+# people to use. It regressed because install.sh was copied wholesale from a
+# CachyOS-only development tree over the version that had this.
+KCC=gcc
+_kcfg=/lib/modules/$(uname -r)/build/.config
+if [[ -f $_kcfg ]]; then
+  grep -q '^CONFIG_CC_IS_CLANG=y' "$_kcfg" 2>/dev/null && KCC=clang
+elif grep -qi 'clang' /proc/version 2>/dev/null; then
+  KCC=clang
+fi
+if [[ $KCC = clang ]]; then
+  CC_FLAGS="CC=clang LD=ld.lld LLVM=1"
+else
+  CC_FLAGS=""
+fi
+ok "kernel compiler: $KCC$([[ $KCC = gcc ]] && echo ' (dkms.conf will be rewritten to drop the clang flags)')"
+
+# Only demand the LLVM toolchain when the kernel actually needs it.
+if [[ $DO_KERNEL -eq 1 && $KCC = clang && ${#SRC_OF[@]} -gt 0 ]]; then
   MAKELINES=$(cat "${SRC_OF[@]/%//dkms.conf}" 2>/dev/null || true)
   declare -a COMPILERS=()
   grep -q 'CC=clang'  <<<"$MAKELINES" && COMPILERS+=(clang)
@@ -290,7 +313,7 @@ if [[ $DO_KERNEL -eq 1 && ${#SRC_OF[@]} -gt 0 ]]; then
   grep -q 'LLVM=1'    <<<"$MAKELINES" && COMPILERS+=(llvm-ar)
   for c in "${COMPILERS[@]:-}"; do
     [[ -n $c ]] || continue
-    command -v "$c" >/dev/null 2>&1 || pf_bad "the modules in this package build with LLVM and '$c' is not installed — pacman -S clang lld llvm / apt install clang lld llvm / dnf install clang lld llvm"
+    command -v "$c" >/dev/null 2>&1 || pf_bad "your kernel is clang-built and '$c' is not installed — pacman -S clang lld llvm / apt install clang lld llvm / dnf install clang lld llvm"
   done
 fi
 
@@ -718,6 +741,27 @@ install_module(){
     fi
     count_module_failure "$m" "$kind"
     return 0
+  fi
+
+  # Match the build recipe to the kernel's compiler. The shipped dkms.conf
+  # hardcodes clang/LLVM; on a GCC kernel those flags make every build fail, and
+  # dkms buries the reason in a log nobody reads. Strip them for GCC, re-add the
+  # right set for clang. Rewrite the COPY in /usr/src, never the packaged source,
+  # so re-running with a different kernel cannot compound the edit.
+  if [[ $DRY_RUN -eq 1 ]]; then
+    [[ $KCC = gcc ]] && plan "would rewrite $dst/dkms.conf for a gcc kernel (drop CC=clang LD=ld.lld LLVM=1)"
+  elif [[ -f $dst/dkms.conf ]]; then
+    sed -i -e 's| CC=clang LD=ld\.lld LLVM=1||g' -e 's| CC=clang LLVM=1||g' "$dst/dkms.conf"
+    if [[ -n $CC_FLAGS ]]; then
+      sed -i -e "s| modules\"| $CC_FLAGS modules\"|g" -e "s| clean\"| $CC_FLAGS clean\"|g" "$dst/dkms.conf"
+    fi
+    # Prove it rather than assume it: a silent no-op sed here produces a build
+    # failure a hundred lines later with no hint of the cause.
+    if [[ $KCC = gcc ]] && grep -q 'CC=clang' "$dst/dkms.conf"; then
+      bad "$m: dkms.conf still specifies clang on a gcc kernel — the build will fail"
+      count_module_failure "$m" "$kind"
+      return 0
+    fi
   fi
 
   # Register the tree with DKMS -- WITHOUT tearing down what is installed now.
