@@ -762,12 +762,14 @@ install_module(){
   [[ ${#names[@]} -gt 0 ]] || names=("$m")
 
   for k in "${KERNELS[@]}"; do
-    if [[ $DRY_RUN -eq 1 ]]; then
-      plan "would run: dkms install --force ${m}/${ver} -k $k   (then check for ${names[*]} under /lib/modules/$k/{updates,extra})"
-      good=$((good+1)); okkernels+=("$k"); KBUILD_OK=$((KBUILD_OK+1))
-      continue
-    fi
-
+    # NOTE: this gate must come BEFORE the dry-run branch. It used to sit after
+    # it, so --dry-run announced "would run: dkms install int3472-patched -k
+    # <kernel>" for kernels the real run then skipped. The direction of that
+    # error is harmless -- the dry run over-reported work -- but describing a
+    # plan the installer would not follow is the one thing --dry-run exists to
+    # get right, and this package has shipped enough messages that did not match
+    # what happened.
+    #
     # Would ours be a downgrade on this kernel? See int3472_redundant above.
     # Not a build failure -- nothing failed -- but it must be visible, and a
     # copy left behind by an EARLIER run is a camera that is broken right now.
@@ -785,6 +787,12 @@ install_module(){
         bad "$m -> $k: an EARLIER run of this installer already put ${leftover[*]} in /lib/modules/$k/updates — that kernel has NO IR flood LED node right now, so Howdy cannot light the illuminator on it"
         action "remove the shadowing copy on $k: sudo dkms remove int3472-patched/$ver -k $k   (this restores $k's in-tree driver and the ir_flood LED)"
       fi
+      continue
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+      plan "would run: dkms install --force ${m}/${ver} -k $k   (then check for ${names[*]} under /lib/modules/$k/{updates,extra})"
+      good=$((good+1)); okkernels+=("$k"); KBUILD_OK=$((KBUILD_OK+1))
       continue
     fi
 
