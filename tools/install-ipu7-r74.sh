@@ -160,6 +160,10 @@ for k in $(ls /lib/modules); do
   if [[ $DRY -eq 1 ]]; then
     printf '    would build for: %s\n' "$k"; BUILT=$((BUILT+1)); continue
   fi
+  # build --force recompiles; install --force only re-places a cached artifact.
+  # Without the build step, patching the source and re-running this changes
+  # nothing at all and still reports success.
+  dkms build --force "ipu7-drivers/$R74_VER" -k "$k" >/dev/null 2>&1 || true
   if dkms install --force "ipu7-drivers/$R74_VER" -k "$k" >/dev/null 2>&1; then
     ok "$k"; BUILT=$((BUILT+1))
   else

@@ -766,7 +766,14 @@ install_module(){
   # second run of a script users are explicitly told to re-run. Verified: a
   # re-run whose builds fail wipes every previously-installed module.
   #
-  # `dkms install --force` rebuilds and replaces in place with no window where
+  # `dkms install --force` forces the INSTALL, not the build: if an artifact is
+  # already cached under /var/lib/dkms/<m>/<ver>/<kernel>/<arch>/module it is
+  # reinstalled verbatim, with no "Building module(s)" line and no recompile. So
+  # patching a source and then running install --force reinstalls the STALE
+  # module and reports success. Verified empirically; it is what left a reporter
+  # chasing a psys fix through three rebuild cycles that never rebuilt anything.
+  # `dkms build --force` is the one that recompiles, so do that first and keep
+  # install --force for the placement, which still avoids the window where
   # nothing is installed, and it reads the source through
   # /var/lib/dkms/<m>/<ver>/source, which is a symlink to the /usr/src tree we
   # have just refreshed. So the ONLY case that still needs a remove is a stale
@@ -828,7 +835,7 @@ install_module(){
     fi
 
     if [[ $DRY_RUN -eq 1 ]]; then
-      plan "would run: dkms install --force ${m}/${ver} -k $k   (then check for ${names[*]} under /lib/modules/$k/{updates,extra})"
+      plan "would run: dkms build --force ${m}/${ver} -k $k, then dkms install --force -k $k   (then check for ${names[*]} under /lib/modules/$k/{updates,extra})"
       good=$((good+1)); okkernels+=("$k"); KBUILD_OK=$((KBUILD_OK+1))
       continue
     fi
@@ -846,6 +853,7 @@ install_module(){
     # --force replaces in place. A plain remove-then-install leaves a window
     # where the module is gone from /lib/modules, and if the build then fails
     # the machine is left with NOTHING installed -- worse than before the run.
+    dkms build --force "${m}/${ver}" -k "$k" >/dev/null 2>&1 || true
     if ! dkms install --force "${m}/${ver}" -k "$k" >/dev/null 2>&1; then
       badk=$((badk+1)); KBUILD_FAIL=$((KBUILD_FAIL+1)); badkernels+=("$k")
       bad "$m: build FAILED for $k"
@@ -1202,7 +1210,7 @@ if [[ $PSYS_TREE_OK -eq 1 ]]; then
   # 3) rebuild ipu7-drivers for every kernel, and verify the psys .ko landed.
   for k in "${KERNELS[@]}"; do
     if [[ $DRY_RUN -eq 1 ]]; then
-      plan "would run: dkms install --force ipu7-drivers/$SRC -k $k"
+      plan "would run: dkms build --force ipu7-drivers/$SRC -k $k, then dkms install --force -k $k"
       continue
     fi
     # --force, never remove-then-install: `dkms remove` deletes the psys module
@@ -1210,6 +1218,7 @@ if [[ $PSYS_TREE_OK -eq 1 ]]; then
     # usual to fail because the source was just patched. That sequence leaves
     # the machine with no psys module at all -- strictly worse than before this
     # installer ran.
+    dkms build --force "ipu7-drivers/$SRC" -k "$k" >/dev/null 2>&1 || true
     if dkms install --force "ipu7-drivers/$SRC" -k "$k" >/dev/null 2>&1; then
       # Prove it from disk, and take the names from the vendor tree's OWN
       # dkms.conf rather than guessing two spellings of "psys": a revision that
@@ -1252,7 +1261,7 @@ if [[ $PSYS_TREE_OK -eq 1 ]]; then
       if lg=$(dkms_log ipu7-drivers "$SRC" "$k"); then
         warn "  build log: $lg"; tail -n 5 "$lg" 2>/dev/null | sed 's/^/          /'
       fi
-      action "ipu7-drivers did not rebuild for $k — fix the build error in the log above and run 'sudo dkms install --force ipu7-drivers/$SRC -k $k'"
+      action "ipu7-drivers did not rebuild for $k — fix the build error in the log above and run 'sudo dkms build --force ipu7-drivers/$SRC -k $k && sudo dkms install --force ipu7-drivers/$SRC -k $k'"
     fi
   done
 fi
