@@ -373,12 +373,18 @@ elif ! ko_cat "$PSYSKO" >/dev/null 2>&1; then
   next "the s2idle suspend patches could not be checked: install zstd (or xz) and re-run if suspend misbehaves"
 else
   n=$(ko_cat "$PSYSKO" 2>/dev/null | grep -aoE 'psys not ready after resume|ioctl: resume failed' | sort -u | wc -l)
+  # "in the loaded build" was wrong: this reads the file modinfo -n points at,
+  # which is what the NEXT boot loads. It prints for a module that is not loaded
+  # at all, and it printed "2/2" beside a MISSING /dev/ipu7-psys0 -- a green
+  # number for a driver that never bound. Say which artefact was read.
   if [ "${n:-0}" -eq 2 ]; then
-    p "psys suspend patches" "2/2 present in the loaded build"
+    p "psys suspend patches" "2/2 present in the module on disk"
   else
-    p "psys suspend patches" "$n/2 — s2idle suspend is only partly patched"
+    p "psys suspend patches" "$n/2 in the module on disk — s2idle suspend is only partly patched"
     next "re-run install.sh: the s2idle suspend patch is not fully present in the psys module ($n of 2 markers)"
   fi
+  sub "read from $PSYSKO, not from the running kernel"
+  mod_loaded intel_ipu7_psys || sub "intel_ipu7_psys is NOT loaded, so this describes what the next boot would load"
   sub "this counts SUSPEND fixes only; it says nothing about whether psys binds"
 fi
 
@@ -464,31 +470,72 @@ else
   # A fresh boot leaves the CSI2->capture link disabled and the pads at their
   # 4096x3072 default, so streaming returns zero frames. Configure the graph
   # first, by the entity NAMES this machine actually has.
-  media-ctl -d "$LD_MEDIA" --set-v4l2 "\"$LD_IR_SENS\":0 [fmt:SGRBG10_1X10/648x368]" 2>/dev/null || true
-  media-ctl -d "$LD_MEDIA" --set-v4l2 "\"$LD_CSI\":0 [fmt:SGRBG10_1X10/648x368]" 2>/dev/null || true
-  media-ctl -d "$LD_MEDIA" --set-v4l2 "\"$LD_CSI\":1 [fmt:SGRBG10_1X10/648x368]" 2>/dev/null || true
-  media-ctl -d "$LD_MEDIA" -l "\"$LD_CSI\":1 -> \"$LD_CAP\":0 [1]" 2>/dev/null || true
+  #
+  # Every one of these used to end in `2>/dev/null || true`. That is the same
+  # bug as the hardcoded CSI-2 port wearing different clothes: when OUR setup
+  # step fails, the stream that follows cannot produce a frame, and the zero
+  # was then reported as "the IR sensor produced no start-of-frame" -- a hard
+  # BROKEN verdict manufactured by this script's own failed command, on a
+  # camera nobody has yet shown to be faulty. A step that did not happen may
+  # not be used as evidence about the hardware.
+  MC_ERR=""
+  mc(){
+    if ! MC_OUT=$(media-ctl -d "$LD_MEDIA" "$@" 2>&1); then
+      [ -n "$MC_ERR" ] || MC_ERR="media-ctl $* -> ${MC_OUT:-(no message)}"
+      return 1
+    fi
+    return 0
+  }
+  mc --set-v4l2 "\"$LD_IR_SENS\":0 [fmt:SGRBG10_1X10/648x368]" || true
+  mc --set-v4l2 "\"$LD_CSI\":0 [fmt:SGRBG10_1X10/648x368]" || true
+  mc --set-v4l2 "\"$LD_CSI\":1 [fmt:SGRBG10_1X10/648x368]" || true
+  mc -l "\"$LD_CSI\":1 -> \"$LD_CAP\":0 [1]" || true
 
-  # Mark the end of the ring buffer and count only what arrives after it. The
-  # old copy ran `dmesg -C`, wiping every boot-time probe message -- including
-  # the evidence the README asks you to paste two steps later.
-  MARK=$(dmesg 2>/dev/null | wc -l)
-  timeout 15 v4l2-ctl -d "$LD_NODE" \
-      --set-fmt-video=width=648,height=368,pixelformat=BA10 \
-      --stream-mmap --stream-count=5 --stream-to=/dev/null >/dev/null 2>&1
-  NOW=$(dmesg 2>/dev/null | wc -l)
-  if [ "$NOW" -lt "$MARK" ]; then
-    p "SOF on csi2-$LD_CSI_PORT" "not tested (the kernel ring buffer wrapped during the test)"
-    untested "the kernel log wrapped mid-test, so start-of-frame events could not be counted"
+  if [ -n "$MC_ERR" ]; then
+    p "capture test" "not tested — the media graph could not be configured"
+    sub "$MC_ERR"
+    sub "the pads and the CSI2->capture link were not set up, so a stream now"
+    sub "could not produce a frame whatever the sensor did. Reporting NO FRAMES"
+    sub "from that would blame the camera for this script's own failed command."
+    untested "the IR capture test could not run: media-ctl failed to configure the graph ($MC_ERR)"
+    next "run 'sudo media-ctl -d $LD_MEDIA -p' and include its output in any report — the graph could not be configured for the capture test"
   else
-    SOF=$(dmesg 2>/dev/null | tail -n +$((MARK + 1)) | grep -c "sof_event::csi2-$LD_CSI_PORT" || true)
-    if [ "${SOF:-0}" -gt 0 ]; then
-      p "SOF on csi2-$LD_CSI_PORT" "$SOF <-- STREAMING"
-      CAPTURE_RESULT=ok
+    # Mark the end of the ring buffer and count only what arrives after it. The
+    # old copy ran `dmesg -C`, wiping every boot-time probe message -- including
+    # the evidence the README asks you to paste two steps later.
+    MARK=$(dmesg 2>/dev/null | wc -l)
+    # Keep v4l2-ctl's exit status AND its message. Discarding them meant an
+    # EBUSY -- the node already held open by PipeWire, which is the normal state
+    # on a desktop -- came out as "0 <-- no frames arrived" and RESULT: BROKEN.
+    CAP_OUT=$(timeout 15 v4l2-ctl -d "$LD_NODE" \
+        --set-fmt-video=width=648,height=368,pixelformat=BA10 \
+        --stream-mmap --stream-count=5 --stream-to=/dev/null 2>&1)
+    CAP_RC=$?
+    NOW=$(dmesg 2>/dev/null | wc -l)
+    if [ "$CAP_RC" -ne 0 ]; then
+      p "capture test" "not tested — v4l2-ctl could not stream from $LD_NODE (exit $CAP_RC)"
+      printf '%s\n' "$CAP_OUT" | sed -n '1,3p' | sed 's/^/      /'
+      case $CAP_OUT in
+        *"Device or resource busy"*|*EBUSY*)
+          sub "something already has the node open — PipeWire and any camera app"
+          sub "hold it. Close them (or 'systemctl --user stop pipewire') and re-run." ;;
+        *) sub "the stream never started, so no conclusion can be drawn about the sensor" ;;
+      esac
+      untested "the IR capture test could not run: v4l2-ctl exited $CAP_RC on $LD_NODE without streaming"
+      next "free $LD_NODE (close camera apps / stop PipeWire) and re-run 'sudo $ROOT/tools/verify.sh' — the capture never started, so IR is untested"
+    elif [ "$NOW" -lt "$MARK" ]; then
+      p "SOF on csi2-$LD_CSI_PORT" "not tested (the kernel ring buffer wrapped during the test)"
+      untested "the kernel log wrapped mid-test, so start-of-frame events could not be counted"
     else
-      p "SOF on csi2-$LD_CSI_PORT" "0 <-- no frames arrived"
-      CAPTURE_RESULT=fail
-      broke "the IR sensor produced no start-of-frame on csi2-$LD_CSI_PORT — it is configured but not streaming"; IR_BROKEN=1
+      SOF=$(dmesg 2>/dev/null | tail -n +$((MARK + 1)) | grep -c "sof_event::csi2-$LD_CSI_PORT" || true)
+      if [ "${SOF:-0}" -gt 0 ]; then
+        p "SOF on csi2-$LD_CSI_PORT" "$SOF <-- STREAMING"
+        CAPTURE_RESULT=ok
+      else
+        p "SOF on csi2-$LD_CSI_PORT" "0 <-- no frames arrived"
+        CAPTURE_RESULT=fail
+        broke "the IR sensor produced no start-of-frame on csi2-$LD_CSI_PORT — the graph was configured and v4l2-ctl streamed without error, so the sensor itself delivered nothing"; IR_BROKEN=1
+      fi
     fi
   fi
 fi
