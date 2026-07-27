@@ -77,6 +77,10 @@ Usage: sudo ./install.sh [--kernel-only|--howdy-only] [--dry-run]
 Exit status: 0 success — everything selected actually happened,
              1 the install did not achieve what it set out to,
              2 preflight failed / bad usage (nothing was touched).
+
+Before installing:  ./tools/check-hardware.sh   is this package for this laptop?
+After rebooting:    sudo ./tools/verify.sh      did it actually work?
+Without hardware:   ./tools/selftest.sh         is this download intact?
 EOF
 }
 
