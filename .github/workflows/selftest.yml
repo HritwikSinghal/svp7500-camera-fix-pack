@@ -58,6 +58,13 @@ jobs:
         working-directory: /tmp/asif
         run: ./tools/selftest.sh
 
+      # The archive is also where a symlink stops being a symlink if the
+      # packaging ever changes: verify.sh is one file under two names, and the
+      # duplicate check only stays meaningful if it still fires here.
+      - name: prove the checks still fire in the archive
+        working-directory: /tmp/asif
+        run: ./tools/selftest.sh --prove
+
       - name: install.sh --help must work from the archive
         working-directory: /tmp/asif
         run: ./install.sh --help

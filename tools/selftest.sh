@@ -21,14 +21,19 @@
 #
 #   ./tools/selftest.sh          human output
 #   ./tools/selftest.sh -q       only failures and the summary
-#   ./tools/selftest.sh --prove  test the test: build a package with the exact
-#                                layout mismatch that shipped, and assert this
-#                                script rejects it. A check nobody has ever
-#                                seen fail is not yet a check.
+#   ./tools/selftest.sh --prove  test the test: build one correct throwaway
+#                                package and nine broken ones -- each carrying a
+#                                bug that shipped or nearly did -- and assert
+#                                this script accepts the first and rejects every
+#                                other. A check nobody has ever seen fail is not
+#                                yet a check.
 #
 # Exit status: 0 = every check passed, 1 = at least one FAIL.
-# WARN never changes the exit status: it marks things a stranger will trip
-# over that do not stop the install.
+# WARN never changes the exit status, so it is reserved for things that are
+# true today and could rot tomorrow (two byte-identical copies of one script).
+# Anything that means an instruction in this package cannot work -- a path that
+# is not there, two files with one name, a module nobody installs -- is a FAIL.
+# A warning that CI ignores is how the verify.sh split shipped.
 # ===========================================================================
 set -uo pipefail
 
@@ -60,46 +65,161 @@ warn(){ n_warn=$((n_warn+1)); WARNS+=("$1")
 rel(){ printf '%s' "${1#"$ROOT"/}"; }
 
 # ---------------------------------------------------------------------------
-# --prove: does the headline check actually fire?
-# Builds two throwaway packages -- one laid out the way the broken installer
-# assumed, one laid out correctly -- and asserts this script rejects the first
-# and accepts the second. Nothing outside the temp directory is touched.
+# A shell script as LOGICAL lines: backslash continuations joined, whole-line
+# comments dropped, and every line tagged CAND or PLAIN.
+#
+# CAND marks a first-match-wins candidate list --
+#     for c in "$HERE/dkms/x.patch" "$HERE/kernel/x.patch"; do
+#       [[ -f $c ]] && { P=$c; break; }
+#     done
+# -- where only ONE of the paths has to exist. A for-loop with no break (and no
+# `return 0`) is an assert-EACH loop, like preflight's "package is missing $f"
+# check: every path in it is independently required.
+#
+# The distinction matters because the reference checker used to group by
+# basename and pass a group when any member existed. That is correct for a real
+# candidate list and wrong for everything else: it is how `git rm verify.sh`
+# still passed while install.sh's last screen told every user to run it.
+logical_lines(){
+  awk '
+    /^[[:space:]]*#/ { next }
+    { line=$0
+      while (line ~ /\\$/) { sub(/\\[[:space:]]*$/,"",line); if ((getline nxt)<=0) break; line=line " " nxt }
+      L[++n]=line }
+    END {
+      for (i=1;i<=n;i++) {
+        tag="PLAIN"
+        if (L[i] ~ /(^|[;&|{}][[:space:]]*|[[:space:]])for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]].*;[[:space:]]*do([[:space:]]|$)/) {
+          for (j=i;j<=n;j++) {
+            if (j>i && L[j] ~ /^[[:space:]]*done([[:space:]]|;|$)/) break
+            if (L[j] ~ /(^|[^A-Za-z0-9_])break([^A-Za-z0-9_]|$)/ ||
+                L[j] ~ /(^|[^A-Za-z0-9_])return[[:space:]]+0([^0-9]|$)/) { tag="CAND"; break }
+          }
+        }
+        print tag "\t" L[i]
+      }
+    }' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# --prove: do these checks actually fire?
+#
+# Builds throwaway packages in a temp directory -- one correct, then one copy per
+# regression, each carrying exactly one real bug that has shipped or nearly did --
+# and asserts this script rejects each of them and accepts the correct one. A
+# check nobody has watched fail is not yet a check, and every one of these was a
+# WARN or a blind spot the day the package went out. Nothing outside the temp
+# directory is touched: no dkms, no modules, no root.
 if [[ ${1:-} == --prove ]]; then
   t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
   mk_pkg(){ # $1 dir, $2 = search path expression install.sh will use
-    mkdir -p "$1/tools" "$1/dkms/demo-1.0"
+    mkdir -p "$1/tools" "$1/dkms/demo-1.0" "$1/udev" "$1/howdy"
     cat > "$1/install.sh" <<EOF
 #!/usr/bin/env bash
 # Tested on: kernels 1.0 through 2.0
 set -euo pipefail
-HERE="\$(cd "\$(dirname "\$0")" && pwd)"
+HERE="\$(cd "\$(dirname "\$(readlink -f "\$0")")" && pwd)"
 REQUIRED_MODULES=(demo)
 find_src(){ local m=\$1 d; for d in $2; do [[ -d \$d && -f \$d/dkms.conf ]] && { echo "\${d%/}"; return 0; }; done; return 1; }
 for m in "\${REQUIRED_MODULES[@]}"; do find_src "\$m" || echo "! \$m not in package, skipping"; done
+install -m 0644 "\$HERE/udev/99-hm1092-ir-led.rules" /etc/udev/rules.d/
+install -m 0444 "\$HERE/howdy/ir_reader.py" /usr/lib/howdy/recorders/ir_reader.py
+patch -p0 -d / < "\$HERE/howdy/video_capture.patch"
 echo "==> Done"
+echo "   sudo \$HERE/verify.sh   check the whole stack"
 EOF
     printf 'PACKAGE_NAME="demo"\nPACKAGE_VERSION="1.0"\nBUILT_MODULE_NAME[0]="demo"\n' > "$1/dkms/demo-1.0/dkms.conf"
+    printf 'MAKE[0]="make -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build modules"\n' \
+      >> "$1/dkms/demo-1.0/dkms.conf"
     printf 'obj-m += demo.o\n' > "$1/dkms/demo-1.0/Makefile"
     : > "$1/dkms/demo-1.0/demo.c"
-    printf '# demo\nkernels 1.0 through 2.0\n' > "$1/README.md"
-    chmod +x "$1/install.sh"
+    printf '# demo\nkernels 1.0 through 2.0\n\nAfter the reboot:\n\n    sudo ./tools/verify.sh\n' > "$1/README.md"
+    printf 'ACTION=="add", KERNEL=="flash*", MODE="0660"\n' > "$1/udev/99-hm1092-ir-led.rules"
+    printf 'class ir_reader:\n    pass\n' > "$1/howdy/ir_reader.py"
+    printf -- '--- a/video_capture.py\n+++ b/video_capture.py\n' > "$1/howdy/video_capture.patch"
+    printf '#!/bin/bash\necho "verification, canonical copy"\n' > "$1/tools/verify.sh"
+    ln -s tools/verify.sh "$1/verify.sh"
+    chmod +x "$1/install.sh" "$1/tools/verify.sh"
     cp "${BASH_SOURCE[0]}" "$1/tools/selftest.sh"; chmod +x "$1/tools/selftest.sh"
   }
+  GOOD_SEARCH='"$HERE"/dkms/"$m"-*/ "$HERE/dkms/$m" "$HERE/kernel/$m"'
   rc=0
-  mk_pkg "$t/broken" '"$HERE/kernel/$m"'                                  # what shipped
-  mk_pkg "$t/good"   '"$HERE"/dkms/"$m"-*/ "$HERE/dkms/$m" "$HERE/kernel/$m"'
-  out_b=$(NO_COLOR=1 "$t/broken/tools/selftest.sh" 2>&1); eb=$?
-  out_g=$(NO_COLOR=1 "$t/good/tools/selftest.sh"   2>&1)
-  if grep -q "CANNOT FIND module 'demo'" <<<"$out_b" && [[ $eb -ne 0 ]]; then
-    printf '  PASS  rejects the shipped layout mismatch (installer looks in kernel/, package ships dkms/)\n'
-  else
-    printf '  FAIL  did NOT reject the layout mismatch — the headline check is asleep\n'; rc=1
-  fi
-  if grep -q "CANNOT FIND" <<<"$out_g"; then
-    printf '  FAIL  rejects a CORRECT package — false positive\n'; rc=1
-  else
+  # mutate <name> -- a copy of the good package for the caller to break
+  mutate(){ cp -a "$t/good" "$t/$1"; printf '%s' "$t/$1"; }
+  # expect_fail <dir> <substring> <what it is>
+  expect_fail(){
+    local d=$1 want=$2 label=$3 out e
+    out=$(NO_COLOR=1 "$d/tools/selftest.sh" 2>&1); e=$?
+    if [[ $e -ne 0 ]] && grep -qF "$want" <<<"$out"; then
+      printf '  PASS  rejects %s\n' "$label"
+    elif [[ $e -eq 0 ]]; then
+      printf '  FAIL  %s exits 0 — %s ships green\n' "$(basename "$d")" "$label"; rc=1
+    else
+      printf '  FAIL  %s failed for the WRONG reason (no "%s" in the output)\n' "$(basename "$d")" "$want"; rc=1
+    fi
+  }
+
+  mk_pkg "$t/good" "$GOOD_SEARCH"
+  out_g=$(NO_COLOR=1 "$t/good/tools/selftest.sh" 2>&1); eg=$?
+  if [[ $eg -eq 0 ]]; then
     printf '  PASS  accepts a correctly laid out package\n'
+  else
+    printf '  FAIL  rejects a CORRECT package — false positive, every proof below is meaningless\n'
+    printf '%s\n' "$out_g" | sed -n 's/^  FAIL/        FAIL/p'; rc=1
   fi
+
+  # 1. THE bug: the installer looks where the package does not put the modules.
+  mk_pkg "$t/layout" '"$HERE/kernel/$m"'
+  expect_fail "$t/layout" "CANNOT FIND module 'demo'" \
+    "the shipped layout mismatch (installer looks in kernel/, package ships dkms/)"
+
+  # 2. The same mistake one function later: a module path built outside the
+  #    candidate list. install.sh catches this at runtime; the package test did not.
+  d=$(mutate copy-step-wrong-layout)
+  printf 'cp -r "$HERE/kernel/$m/." /tmp/staging\n' >> "$d/install.sh"
+  expect_fail "$d" "outside its candidate list" "a module path expression that resolves for no module"
+
+  # 3. Divergent duplicate: the verify.sh split that shipped. install.sh points
+  #    at the root copy, the README at tools/ — and they are different files.
+  d=$(mutate divergent-verify)
+  rm "$d/verify.sh"; cp "$d/tools/verify.sh" "$d/verify.sh"
+  printf 'echo "STALE COPY: no stale-module check here"\n' >> "$d/verify.sh"
+  expect_fail "$d" "exists twice with DIFFERENT contents" "two verify.sh files with different contents"
+  expect_fail "$d" "point at DIFFERENT files named verify.sh" \
+    "install.sh and the README sending users to different files"
+
+  # 4. Either half of the pair deleted. Grouping by basename used to pass both
+  #    of these at "1 of 2 candidate paths present".
+  d=$(mutate tools-verify-deleted); rm "$d/tools/verify.sh"
+  expect_fail "$d" "DANGLING symlink" "the canonical copy deleted out from under the root name"
+  d=$(mutate root-verify-deleted); rm "$d/verify.sh"
+  expect_fail "$d" "referenced but MISSING from the package: verify.sh" \
+    "install.sh's own next-steps command pointing at a file that is not shipped"
+
+  # 5. A documented root-level command that does not exist. The reference
+  #    checker only knew subdirectory paths, so the README's entry point --
+  #    the first thing a stranger types -- was the one path nothing checked.
+  d=$(mutate readme-phantom-command)
+  printf '\nQuick start:\n\n    sudo ./setup-ir.sh --all\n' >> "$d/README.md"
+  expect_fail "$d" "referenced but MISSING from the package: setup-ir.sh" \
+    "a README quick-start naming a script that was never committed"
+
+  # 6. A module shipped but never wired into install.sh: a maintainer adds a
+  #    sensor driver for someone else's board and forgets the *_MODULES line.
+  d=$(mutate module-not-wired); mkdir -p "$d/dkms/extra-1.0"
+  printf 'PACKAGE_NAME="extra"\nPACKAGE_VERSION="1.0"\nBUILT_MODULE_NAME[0]="extra"\n' > "$d/dkms/extra-1.0/dkms.conf"
+  printf 'MAKE[0]="make -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build modules"\n' \
+    >> "$d/dkms/extra-1.0/dkms.conf"
+  printf 'obj-m += extra.o\n' > "$d/dkms/extra-1.0/Makefile"; : > "$d/dkms/extra-1.0/extra.c"
+  expect_fail "$d" "dkms/extra is shipped but install.sh never installs it" \
+    "a module directory the installer never names"
+
+  # 7. MAKE[0] building in a directory the package does not contain: dkms fails
+  #    per kernel, inside a log file, worded like a build quirk.
+  d=$(mutate make-line-bogus)
+  sed -i 's|/build modules|/build/src modules|' "$d/dkms/demo-1.0/dkms.conf"
+  expect_fail "$d" "is not in this package" "a MAKE[0] M= path that does not exist in the package"
+
   exit $rc
 fi
 
@@ -127,7 +247,22 @@ ALL_M=("${REQUIRED_M[@]}" "${OPTIONAL_M[@]}" "${LOOP_M[@]}")
 mapfile -t ALL_M < <(printf '%s\n' "${ALL_M[@]:-}" | grep -v '^$' | sort -u)
 
 # search patterns: every "$HERE/...$m..." path expression in install.sh
-mapfile -t MOD_PATTERNS < <(grep -oE '"?\$HERE"?/[^ ;)]*\$\{?m\}?[^ ;)]*' "$INSTALL" | tr -d '"' | sort -u)
+MOD_PAT_RE='"?\$HERE"?/[^ ;)]*\$\{?m\}?[^ ;)]*'
+mapfile -t MOD_PATTERNS < <(grep -oE "$MOD_PAT_RE" "$INSTALL" | tr -d '"' | sort -u)
+# ...and the subset written OUTSIDE a first-match candidate list. Inside one,
+# a pattern that resolves for nothing is a harmless fallback; outside one it is
+# a path the installer will actually use, so it has to work for every module.
+mapfile -t MOD_PAT_PLAIN < <(logical_lines "$INSTALL" | grep '^PLAIN' \
+                             | grep -oE "$MOD_PAT_RE" | tr -d '"' | sort -u)
+
+mod_expand(){ local e=${1//\$HERE/$ROOT}; e=${e//\$\{m\}/$2}; printf '%s' "${e//\$m/$2}"; }
+mod_hit(){ # <pattern> <module> -> prints the source dir it resolves to, or fails
+  local e d; e=$(mod_expand "$1" "$2")
+  for d in $e; do d=${d%/}; d=${d%/.}
+    [[ -d $d && -f $d/dkms.conf ]] && { printf '%s' "$d"; return 0; }
+  done
+  return 1
+}
 
 if [[ ${#ALL_M[@]} -eq 0 ]]; then
   fail "cannot determine which modules install.sh installs" \
@@ -141,12 +276,9 @@ else
   for m in "${ALL_M[@]}"; do
     found=""; tried=()
     for pat in "${MOD_PATTERNS[@]}"; do
-      e=${pat//\$HERE/$ROOT}; e=${e//\$\{m\}/$m}; e=${e//\$m/$m}
-      tried+=("$(rel "$e")")
-      for d in $e; do
-        d=${d%/}
-        [[ -d $d && -f $d/dkms.conf ]] && { found=$d; break 2; }
-      done
+      tried+=("$(rel "$(mod_expand "$pat" "$m")")")
+      found=$(mod_hit "$pat" "$m") && break
+      found=""
     done
     optional=0
     for o in "${OPTIONAL_M[@]:-}"; do [[ $o == "$m" ]] && optional=1; done
@@ -162,17 +294,44 @@ else
            "shipped:  ${shipped:-(nothing matching)}"
     fi
   done
+
+  # Every module path expression written OUTSIDE the candidate list must work
+  # for EVERY module the installer names. find_src()'s list may contain a
+  # fallback that matches nothing in the published layout -- that is what a
+  # fallback is for -- but a path built anywhere else (the copy step, a backup,
+  # a dkms add) is used directly, and one wrong layout assumption there skips
+  # the module exactly the way the shipped bug did, one function later.
+  for pat in "${MOD_PAT_PLAIN[@]:-}"; do
+    [[ -z $pat ]] && continue
+    misses=(); for m in "${ALL_M[@]}"; do mod_hit "$pat" "$m" >/dev/null || misses+=("$m"); done
+    if [[ ${#misses[@]} -eq ${#ALL_M[@]} ]]; then
+      fail "install.sh uses the path '$pat' outside its candidate list, and it resolves for NO module" \
+           "expanded for ${ALL_M[0]}: $(rel "$(mod_expand "$pat" "${ALL_M[0]}")")" \
+           "this is the shipped bug's shape: the module is looked for where the package does not put it"
+    elif [[ ${#misses[@]} -gt 0 ]]; then
+      fail "install.sh uses the path '$pat' outside its candidate list; it resolves for ${#ALL_M[@]} modules minus: ${misses[*]}" \
+           "that step is skipped for those modules while the rest of the run reports success"
+    else
+      pass "direct path '$pat' resolves for all ${#ALL_M[@]} module(s)"
+    fi
+  done
 fi
 
 # the reverse: a module in the package that the installer never names is a
-# module nobody receives -- the same silent no-op, one level up
+# module nobody receives -- the same silent no-op, one level up. This is a
+# FAILURE, not a warning: a maintainer adding a sensor driver for one of the
+# reporters' boards and forgetting the *_MODULES line ships a package that
+# delivers nothing for that board and says Done. If a tree is meant to be inert
+# for now, name it in OPTIONAL_MODULES so the intent is recorded in install.sh
+# instead of inferred from silence.
 for conf in "$ROOT"/dkms/*/dkms.conf; do
   [[ -f $conf ]] || continue
   nm=$(sed -n 's/^PACKAGE_NAME="\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' "$conf" | head -1)
   known=0
   for m in "${ALL_M[@]:-}"; do [[ $m == "$nm" ]] && known=1; done
-  [[ $known -eq 1 ]] || warn "dkms/$nm is shipped but install.sh never installs it" \
-                             "installer knows: ${ALL_M[*]:-(none)}"
+  [[ $known -eq 1 ]] || fail "dkms/$nm is shipped but install.sh never installs it" \
+                             "installer knows: ${ALL_M[*]:-(none)}" \
+                             "add it to REQUIRED_MODULES/OPTIONAL_MODULES in install.sh, or drop the directory"
 done
 
 # ===========================================================================
@@ -182,6 +341,7 @@ section "dkms.conf is valid and matches the Makefile"
 # log, so it surfaces as one terse per-kernel warning that reads like a build
 # quirk rather than a packaging error.
 
+CLANG_YES=(); CLANG_NO=()
 for conf in "$ROOT"/dkms/*/dkms.conf; do
   [[ -f $conf ]] || continue
   d=$(dirname "$conf"); b=$(basename "$d")
@@ -202,9 +362,49 @@ for conf in "$ROOT"/dkms/*/dkms.conf; do
         "install.sh installs to /usr/src/$name-$ver — a mismatch is how a stale tree gets built instead"
   fi
 
+  # MAKE[0] is the other half of the build contract, and it is the half that
+  # fails per-kernel inside a log file. `M=` names the directory dkms builds in;
+  # dkms copies THIS package directory there, so any trailing subpath must exist
+  # here too. A stale `M=.../build/src` compiles nothing and reports it once per
+  # kernel, worded like a build quirk.
+  mkline=$(sed -n 's/^MAKE\[0\]=//p' "$conf" | head -1); mkline=${mkline%\"}; mkline=${mkline#\"}
   mk="$d/Makefile"
+  if [[ -z $mkline ]]; then
+    warn "$(rel "$conf"): no MAKE[0] — dkms falls back to its own default build command"
+  else
+    if grep -q 'CC=clang' <<<"$mkline"; then CLANG_YES+=("$b"); else CLANG_NO+=("$b"); fi
+    grep -qE '[$]\{?kernel_source_dir\}?' <<<"$mkline" \
+      || fail "$(rel "$conf"): MAKE[0] never mentions kernel_source_dir" \
+              "dkms would build against whatever kernel make picks, not the one being installed for"
+    mval=$(grep -oE '(^|[[:space:]])M=[^[:space:]"]+' <<<"$mkline" | head -1); mval=${mval#" "}; mval=${mval#M=}
+    if [[ -z $mval ]]; then
+      fail "$(rel "$conf"): MAKE[0] has no M= build directory" "$mkline"
+    else
+      exp=$mval
+      exp=${exp//'${dkms_tree}'/@T@};       exp=${exp//'$dkms_tree'/@T@}
+      exp=${exp//'${PACKAGE_NAME}'/$name};    exp=${exp//'$PACKAGE_NAME'/$name}
+      exp=${exp//'${PACKAGE_VERSION}'/$ver};  exp=${exp//'$PACKAGE_VERSION'/$ver}
+      pre="@T@/$name/$ver/build"
+      if [[ $exp == "$pre" || $exp == "$pre"/* ]]; then
+        sub=${exp#"$pre"}; sub=${sub#/}
+        tgt="$d${sub:+/$sub}"
+        if [[ -d $tgt ]]; then
+          mk="$tgt/Makefile"
+          [[ -f $mk ]] || fail "$(rel "$conf"): MAKE[0] builds in M=$mval but $(rel "$tgt") has no Makefile"
+          [[ -z $sub ]] || pass "$(rel "$conf"): MAKE[0] builds in $sub/, which the package ships"
+        else
+          fail "$(rel "$conf"): MAKE[0] builds in M=$mval — '$sub' is not in this package" \
+               "dkms runs make in a directory that does not exist and every kernel's build fails in a log"
+        fi
+      else
+        fail "$(rel "$conf"): MAKE[0]'s M=$mval is not the dkms build directory for $name/$ver" \
+             "expected \${dkms_tree}/$name/$ver/build[/subdir] — anything else builds a tree dkms did not stage"
+      fi
+    fi
+  fi
+
   if [[ ! -f $mk ]]; then
-    fail "$(rel "$d"): no Makefile — dkms has nothing to run"
+    [[ -f $d/Makefile ]] || fail "$(rel "$d"): no Makefile — dkms has nothing to run"
   else
     for bm in "${built[@]}"; do
       grep -qE "(^|[[:space:]])${bm//./\\.}\.o([[:space:]]|$)" "$mk" \
@@ -213,12 +413,23 @@ for conf in "$ROOT"/dkms/*/dkms.conf; do
       objs=$(sed -n "s/^${bm//./\\.}-y[[:space:]]*:=[[:space:]]*//p" "$mk")
       [[ -z $objs ]] && objs="$bm.o"
       for o in $objs; do
-        [[ -f "$d/${o%.o}.c" ]] || fail "$(rel "$d"): missing source ${o%.o}.c (needed for $bm)" \
+        [[ -f "${mk%/Makefile}/${o%.o}.c" ]] || fail "$(rel "${mk%/Makefile}"): missing source ${o%.o}.c (needed for $bm)" \
                                         "the module is listed but its code is not in the package"
       done
     done
   fi
 done
+
+# These trees are built with clang against clang-built kernels. One conf losing
+# CC=clang while its siblings keep it builds that module with a different
+# toolchain than the kernel it loads into -- which surfaces as a load failure,
+# not a build failure, long after the installer said Done.
+if [[ ${#CLANG_YES[@]} -gt 0 && ${#CLANG_NO[@]} -gt 0 ]]; then
+  warn "MAKE[0] toolchain is inconsistent: ${CLANG_NO[*]} build without CC=clang, ${CLANG_YES[*]} with it" \
+       "if that is deliberate, say so in the dkms.conf; if not, the odd one out will not load"
+elif [[ ${#CLANG_YES[@]} -gt 0 ]]; then
+  pass "all ${#CLANG_YES[@]} dkms.conf MAKE[0] lines use the same toolchain (CC=clang)"
+fi
 
 # ===========================================================================
 section "every path the scripts reference exists in the package"
@@ -226,66 +437,115 @@ section "every path the scripts reference exists in the package"
 # its own directory ($HERE=$(cd "$(dirname "$0")" ...)) has that variable name
 # discovered, so new scripts are covered without editing anything here.
 #
-# Candidate lists are handled the way install.sh uses them -- `for c in A B` only
-# needs one of A or B to exist -- so references are grouped by basename and a
-# group passes when any member is present. The group's members are printed, so
-# "1 of 3 present" is visible rather than assumed.
+# Every reference must resolve ON ITS OWN. The single exception is a real
+# first-match-wins candidate list -- `for c in A B; do [[ -f $c ]] && break` --
+# where the code itself only needs one of the paths; those, and only those, are
+# grouped, and the group prints "1 of 2 present" so the tolerance is visible.
+#
+# This used to group by BASENAME instead, which quietly merged unrelated
+# references: install.sh's `$HERE/verify.sh` and the README's `tools/verify.sh`
+# became one group, and deleting either file still passed at "1 of 2 candidate
+# paths present" while one of the two documented commands no longer existed.
 
-declare -A REFS=()
-# add_ref <path> <strict>
+declare -A GRP=()
+declare -a REFLOG=()
+# add_ref <path> <strict> <group-id> <origin>
 #   strict=1  a real code path ($HERE/...): the file must be there, full stop.
 #   strict=0  a path named in prose or a comment: required only when its parent
 #             directory exists here, so documentation that quotes a path in some
 #             OTHER tree (kernel/drivers/staging/..., /usr/lib/howdy/...) does
 #             not masquerade as a missing package file.
+#   group-id  paths sharing one id satisfy each other (candidate lists only).
+#             Everything else uses "path:<p>", so the same path mentioned in ten
+#             places is one check and two different paths are two checks.
 add_ref(){
-  local p=${1#/} strict=$2 b hit=0 req
+  local p=${1#/} strict=$2 gid=$3 origin=${4:-} hit=0 req
   [[ -z $p || $p == . || $p == .. ]] && return 0
   [[ $p == .git* || $p == */.git* ]] && return 0
-  b=$(basename "$p")
-  case " ${REFS[$b]:-} " in *" $p|"*) return 0;; esac      # same path, said twice
+  [[ $p == ../* || $p == */../* ]] && return 0             # outside the package
   [[ -e $ROOT/$p ]] && hit=1
   req=$strict
   [[ $strict -eq 0 && -d $ROOT/$(dirname "$p") ]] && req=1
-  REFS[$b]="${REFS[$b]:-} $p|$hit|$req"
+  REFLOG+=("$origin|$(basename "$p")|$p|$hit")
+  case " ${GRP[$gid]:-} " in *" $p|"*) return 0;; esac      # same path, said twice
+  GRP[$gid]="${GRP[$gid]:-} $p|$hit|$req"
 }
 sane_token(){ [[ -n $1 && $1 != *'$'* && $1 != *'*'* && $1 != *'{'* && $1 != *'}'* && $1 != *'<'* && $1 != *'('* ]]; }
 
 KNOWN_TOP='tools|udev|howdy|dkms|kernel|scripts|docs|ipu7poke|usbio-patch'
 
 for s in "${SCRIPTS[@]}"; do
+  rs=$(rel "$s")
   # a variable is this script's own root only if it is assigned from $0 / BASH_SOURCE
   mapfile -t rootvars < <(grep -E '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=.*dirname.*(\$0|BASH_SOURCE)' "$s" \
                           | sed -E 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/' | sort -u)
   rootvars+=(HERE)
-  code=$(grep -vE '^[[:space:]]*#' "$s")
-  for v in "${rootvars[@]}"; do
+  ln=0
+  while IFS=$'\t' read -r tag line; do
+    ln=$((ln+1))
+    toks=()
+    for v in "${rootvars[@]}"; do
+      while read -r tok; do
+        tok=$(printf '%s' "$tok" | tr -d '"'"'")
+        tok=${tok#\$\{$v\}/}; tok=${tok#\$$v/}
+        tok=${tok%%[),\`]*}
+        sane_token "$tok" && toks+=("$tok")
+      done < <(grep -oE "\"?\\\$\{?$v\}?\"?/[^ ;)\`]*" <<<"$line")
+    done
+    # $(dirname ...)/x is only a PACKAGE path when the dirname is of this
+    # script itself. `$(dirname "$HOWDY_BIN")/recorders` is a path on the user's
+    # machine, and demanding the package ship a "recorders" file is a false
+    # accusation of the kind this whole package exists to stop making.
     while read -r tok; do
-      tok=$(printf '%s' "$tok" | tr -d '"'"'")
-      tok=${tok#\$\{$v\}/}; tok=${tok#\$$v/}
-      tok=${tok%%[),\`]*}
-      sane_token "$tok" && add_ref "$tok" 1
-    done < <(grep -oE "\"?\\\$\{?$v\}?\"?/[^ ;)\`]*" <<<"$code")
-  done
-  while read -r tok; do
-    tok=${tok#*)/}; tok=$(printf '%s' "$tok" | tr -d '"'"'")
-    sane_token "$tok" && add_ref "$tok" 1
-  done < <(grep -oE '\$\(dirname[^)]*\)/[A-Za-z0-9_./-]+' <<<"$code")
+      tok=${tok#*)/}; tok=$(printf '%s' "$tok" | tr -d '"'"'")
+      sane_token "$tok" && toks+=("$tok")
+    done < <(grep -oE '\$\(dirname[^)]*(\$0|BASH_SOURCE)[^)]*\)/[A-Za-z0-9_./-]+' <<<"$line")
+    [[ ${#toks[@]} -eq 0 ]] && continue
+    if [[ $tag == CAND && ${#toks[@]} -gt 1 ]]; then
+      for t in "${toks[@]}"; do add_ref "$t" 1 "cand:$rs:$ln" "$rs"; done
+    else
+      for t in "${toks[@]}"; do add_ref "$t" 1 "path:$t" "$rs"; done
+    fi
+  done < <(logical_lines "$s")
 done
 
-# repo-relative paths named in scripts, comments and docs ("run tools/verify.sh")
+# Paths named in scripts, comments and docs: repo-relative ("run tools/verify.sh")
+# and root-level ("sudo ./install.sh"). The root-level form used to be invisible
+# here -- the pattern only knew the subdirectory names -- so the README's own
+# entry point, the thing every stranger types first, was the one path nothing
+# checked. A quick-start block naming a script that was never committed passed.
 for f in "${SCRIPTS[@]}" "${DOCS[@]}"; do
-  while read -r tok; do
+  rf=$(rel "$f"); fdir=$(dirname "$rf"); [[ $fdir == . ]] && fdir=""
+  # This file is the checker, not documentation: its comments quote paths and
+  # commands as EVIDENCE (the fixtures --prove builds, the scripts whose past
+  # bugs each check exists for). Treating those as instructions to the user
+  # would make every explanation a maintenance burden.
+  [[ $f == "${BASH_SOURCE[0]}" || $rf == tools/selftest.sh ]] && continue
+  while read -r kind tok; do
     tok=${tok%%[\`,\"\']*}; tok=${tok%.}; tok=${tok%:}
     sane_token "$tok" || continue
     [[ $tok == */ && -d $ROOT/${tok%/} ]] && continue    # bare directory in prose
-    add_ref "$tok" 0
-  done < <(grep -hoE "(^|[^A-Za-z0-9_/.\$-])($KNOWN_TOP)/[A-Za-z0-9_./-]+" "$f" | sed -E 's@^[^A-Za-z]*@@')
+    # prose that merely reads like a path -- "a kernel/udev concern" -- is not a
+    # reference. Require a filename (something.ext) unless the path is real.
+    [[ ${tok##*/} == *.* || -e $ROOT/$tok ]] || continue
+    if [[ $kind == DOT && $tok != */* && -n $fdir ]]; then
+      # a bare dot-slash command in a file that lives in a subdirectory is
+      # ambiguous: a script's own usage line means "beside me", a README-style
+      # quick start means "from the repo root". Either resolving is enough;
+      # neither resolving is a documented command that cannot be typed.
+      add_ref "$fdir/$tok" 0 "dot:$rf:$tok" "$rf"
+      add_ref "$tok"       0 "dot:$rf:$tok" "$rf"
+    else
+      add_ref "$tok" 0 "path:$tok" "$rf"
+    fi
+  done < <( { grep -hoE "(^|[^A-Za-z0-9_/.\$-])($KNOWN_TOP)/[A-Za-z0-9_./-]+" "$f" | sed -E 's@^[^A-Za-z]*@@; s@^@REL @'
+              grep -hoE "(^|[^A-Za-z0-9_/-])\./[A-Za-z0-9_./-]+\.(sh|py)" "$f" | sed -E 's@^[^.]*\./@@; s@^@DOT @'
+            } )
 done
 
-for b in "${!REFS[@]}"; do
+while read -r gid; do
   present=0; total=0; required=0; detail=""; miss=""
-  for e in ${REFS[$b]}; do
+  for e in ${GRP[$gid]}; do
     total=$((total+1))
     IFS='|' read -r epath ehit ereq <<<"$e"
     [[ $ereq == 1 ]] && required=1
@@ -298,7 +558,42 @@ for b in "${!REFS[@]}"; do
     fail "referenced but MISSING from the package:$miss" \
          "a script or doc points at a file that is not here; whatever uses it gets skipped"
   fi
+done < <(printf '%s\n' "${!GRP[@]}" | sort)
+
+# install.sh's last screen and the README must send the user to the SAME file.
+# They did not: install.sh said `sudo $HERE/verify.sh`, the README said
+# `sudo ./tools/verify.sh`, and the two were 37 lines apart -- the installer
+# recommending the copy that could not detect the failure it had just warned
+# about. Comparing resolved paths (so a symlink counts as the same file) makes
+# that divergence impossible to ship again.
+declare -A IREF=() RREF=()
+for r in "${REFLOG[@]}"; do
+  IFS='|' read -r org rb rp rhit <<<"$r"
+  [[ $rhit == 1 ]] || continue
+  real=$(readlink -f "$ROOT/$rp")
+  case $org in
+    install.sh) IREF[$rb]="${IREF[$rb]:-} $real" ;;
+    README.md)  RREF[$rb]="${RREF[$rb]:-} $real" ;;
+  esac
 done
+while read -r rb; do
+  [[ -z $rb || -z ${RREF[$rb]:-} ]] && continue
+  # They agree if some file is named by both. install.sh listing two candidates
+  # for one file is fine; naming a DIFFERENT file than the README is not.
+  common=""
+  for x in ${IREF[$rb]}; do
+    for y in ${RREF[$rb]}; do [[ $x == "$y" ]] && common=$x; done
+  done
+  if [[ -z $common ]]; then
+    mapfile -t u < <(printf '%s\n' ${IREF[$rb]} ${RREF[$rb]} | sort -u)
+    fail "install.sh and README.md point at DIFFERENT files named $rb" \
+         "install.sh: $(for x in ${IREF[$rb]}; do printf '%s ' "$(rel "$x")"; done)" \
+         "README.md:  $(for x in ${RREF[$rb]}; do printf '%s ' "$(rel "$x")"; done)" \
+         "one of the two instructions is the stale one and the user cannot tell which"
+  else
+    pass "install.sh and README.md agree on $rb -> $(rel "$common")"
+  fi
+done < <(printf '%s\n' "${!IREF[@]}" | sort)
 
 # ===========================================================================
 section "installer assets install.sh copies verbatim"
@@ -371,7 +666,8 @@ AWK_BUILTINS=' NF NR FS OFS ORS RS FILENAME FNR SUBSEP RSTART RLENGTH CONVFMT OF
 SHELL_ENV=' HOME PATH USER LOGNAME EUID UID PWD OLDPWD IFS SHELL TERM LANG LC_ALL HOSTNAME
  RANDOM SECONDS LINENO BASH BASH_SOURCE BASH_VERSION BASH_REMATCH FUNCNAME PIPESTATUS REPLY
  OPTARG OPTIND CDPATH TMPDIR SUDO_USER SUDO_UID DISPLAY XDG_RUNTIME_DIR EDITOR NO_COLOR
- KERNELRELEASE KERNEL_SRC KVER KBUILD MAKE CC LD DESTDIR '
+ KERNELRELEASE KERNEL_SRC KVER KBUILD MAKE CC LD DESTDIR
+ dkms_tree kernel_source_dir PACKAGE_NAME PACKAGE_VERSION '
 CODE=$(mktemp); trap 'rm -f "$CODE"' EXIT
 for s in "${SCRIPTS[@]}"; do
   grep -qE '^[[:space:]]*set[[:space:]]+-[a-z]*u|set -o nounset' "$s" || continue
@@ -469,25 +765,50 @@ else
 fi
 
 # ===========================================================================
-section "no divergent duplicate copies"
+section "one canonical copy of every script"
 # Two files with the same name and different contents is how a user ends up
-# running the older one. The root verify.sh and tools/verify.sh drifted exactly
-# this way: the copy at the root -- the one people reach for -- was the one
-# missing the stale-module and psys-reason diagnostics.
+# running the older one. verify.sh drifted exactly this way: install.sh's last
+# screen said `sudo $HERE/verify.sh` (the root copy) while the README said
+# `sudo ./tools/verify.sh`, and the root copy was 37 lines behind -- missing the
+# stale-module and psys-reason diagnostics, i.e. unable to detect the failure
+# install.sh had warned about eight lines earlier. That shipped because this
+# check was a WARN and CI stayed green. It is a FAIL now.
+#
+# Symlinks are scanned too: one file under two names is the fix, and it only
+# works if the link resolves inside the package.
+mapfile -t NODES < <(find "$ROOT" -path "$ROOT/.git" -prune -o -name '*.sh' \( -type f -o -type l \) -print | sort)
 declare -A SEEN=()
-while read -r f; do
-  b=$(basename "$f")
+for f in "${NODES[@]}"; do
+  b=$(basename "$f"); rf=$(rel "$f")
+  if [[ -L $f ]]; then
+    tgt=$(readlink -f "$f")
+    if [[ -z $tgt || ! -e $tgt ]]; then
+      fail "$rf is a DANGLING symlink -> $(readlink "$f")" \
+           "anyone following an instruction that names it gets 'No such file or directory'"
+      continue
+    fi
+    case $tgt in
+      "$ROOT"/*) ;;
+      *) fail "$rf points OUTSIDE the package -> $tgt" \
+              "it resolves on the author's machine and nowhere else"; continue ;;
+    esac
+  fi
   if [[ -n ${SEEN[$b]:-} ]]; then
-    if cmp -s "$f" "${SEEN[$b]}"; then
-      pass "$b: $(rel "${SEEN[$b]}") and $(rel "$f") are identical copies"
+    o=${SEEN[$b]}
+    if [[ $(readlink -f "$f") == "$(readlink -f "$o")" ]]; then
+      pass "$b: $(rel "$o") and $rf are the same file — they cannot drift"
+    elif cmp -s "$f" "$o"; then
+      warn "$b is shipped twice as two separate files: $(rel "$o") and $rf" \
+           "byte-identical today, and nothing keeps them that way — make one a symlink to the other"
     else
-      warn "$b exists twice with DIFFERENT contents: $(rel "${SEEN[$b]}") vs $(rel "$f")" \
-           "$(diff "${SEEN[$b]}" "$f" | grep -c '^[<>]') differing lines — which one the user runs is a coin flip"
+      fail "$b exists twice with DIFFERENT contents: $(rel "$o") vs $rf" \
+           "$(diff "$o" "$f" | grep -c '^[<>]') differing lines — whichever the user was told to run, the other is stale" \
+           "keep one file and point every reference at it (a symlink counts)"
     fi
   else
     SEEN[$b]=$f
   fi
-done < <(printf '%s\n' "${SCRIPTS[@]}")
+done
 
 # ===========================================================================
 printf '\n%s──────── selftest summary ────────%s\n' "$C_B" "$C_0"
