@@ -10,9 +10,17 @@ no device at all, or a device that never delivers a frame, on a stock kernel.
 majority of laptops, including most non-Dell machines — nothing here applies and
 you should not install it.
 
-Run the [hardware check](#step-0--check-your-hardware-first-2-minutes) below
-before you install anything. It takes two minutes and tells you definitively
-whether this package is for your machine.
+**Is it for your laptop? One command, 5 seconds, changes nothing:**
+
+```bash
+git clone https://github.com/jibsta210/svp7500-camera-fix-pack
+cd svp7500-camera-fix-pack
+./tools/check-hardware.sh
+```
+
+Its last line is either `APPLIES TO THIS MACHINE: yes — ...` or
+`APPLIES TO THIS MACHINE: no — ...` with the reason. If it says no, stop:
+nothing here will help you, and `install.sh` will refuse to run anyway.
 
 > ### Testing scope — please read
 >
@@ -44,31 +52,36 @@ whether this package is for your machine.
 
 ---
 
-## Step 0 — check your hardware FIRST (2 minutes)
-
-Run this whole block. It is read-only and changes nothing.
+## Step 0 — check your hardware FIRST (5 seconds)
 
 ```bash
-echo "--- 1. CVS bridge (Synaptics SVP7500) ---"
-lsusb -d 06cb:0701 || echo "NOT PRESENT"
-
-echo "--- 2. Bridge ACPI id ---"
-ls /sys/bus/i2c/devices/ 2>/dev/null | grep -iE 'INTC10(CF|DE|E0|E1)' || echo "none"
-
-echo "--- 3. Sensors the firmware declares ---"
-ls /sys/bus/acpi/devices/ 2>/dev/null | grep -iE 'HIMX1092|OVTI08F4|OVTI05C1|INT3472' || echo "none"
-
-echo "--- 4. Intel IPU present? ---"
-lspci -nn | grep -iE 'image signal|imaging|IPU' || echo "no IPU on PCI"
-
-echo "--- 5. Is it actually a plain USB webcam? ---"
-ls /sys/bus/usb/drivers/uvcvideo/ 2>/dev/null | grep -q ':' && echo "UVC WEBCAM BOUND — see table below" || echo "no UVC webcam"
+./tools/check-hardware.sh
 ```
+
+Read-only: it needs no root, installs nothing and changes nothing. It prints
+what it found and ends with a verdict:
+
+```
+  CVS bridge on USB            06cb:0701
+  bridge ACPI id               INTC10E1
+  sensors in firmware          HIMX1092 INT3472 OVTI08F4
+  Intel imaging unit           0000:00:05.0 0xb05d
+  IPU6 machine                 no
+  USB (uvcvideo) webcam        none bound
+
+APPLIES TO THIS MACHINE: yes — found a CVS bridge or its ACPI id, plus a
+sensor the firmware declares
+```
+
+Exit status: `0` this package applies, `1` it does not, `2` it must not be
+installed (IPU6 machine). `install.sh` runs this same check and refuses to
+continue when the answer is no, so you cannot install this on the wrong laptop
+by accident.
 
 ### Reading the result
 
-**This package is for you** if you see the bridge in (1) *or* an `INTC10xx` id in
-(2), plus a sensor in (3). The bridge id tells you your platform:
+**This package is for you** if you see a CVS bridge *or* an `INTC10xx` ACPI id,
+plus a sensor. The bridge id tells you your platform:
 
 | ACPI id | platform |
 |---|---|
@@ -77,9 +90,10 @@ ls /sys/bus/usb/drivers/uvcvideo/ 2>/dev/null | grep -q ':' && echo "UVC WEBCAM 
 | `INTC10E0` | Arrow Lake |
 | `INTC10E1` | Panther Lake |
 
-Sensors you may see in (3): `OVTI08F4` (OV08x40, RGB), `OVTI05C1` (OV05C10,
-RGB), `HIMX1092` (HM1092, IR). `INT3472` is the power/GPIO controller that owns
-the IR illuminator.
+Sensors you may see: `OVTI08F4` (OV08x40, RGB), `OVTI05C1` (OV05C10, RGB),
+`HIMX1092` (HM1092, IR). `INT3472` is the power/GPIO controller that owns the IR
+illuminator. Many boards have **no IR sensor at all** — that is a supported,
+complete configuration, not a missing piece.
 
 **MIPI/IPU sensor vs UVC webcam** — this is the distinction that matters most:
 
@@ -127,46 +141,73 @@ Optional but recommended on Btrfs: `sudo snapper create -d "pre-svp7500-fix"`.
 
 ## Step 2 — install
 
+Rehearse first. `--dry-run` runs every check and prints every action it would
+take, and changes nothing at all:
+
 ```bash
-git clone https://github.com/jibsta210/svp7500-camera-fix-pack
-cd svp7500-camera-fix-pack
-sudo ./install.sh            # add --kernel-only if you do not use Howdy
+sudo ./install.sh --dry-run     # rehearsal — changes nothing
+sudo ./install.sh               # add --kernel-only if you do not use Howdy
 ```
 
+If the dry run ends in `Dry run found problems`, the real run would hit the same
+ones. Fix them first; you have not touched anything yet.
+
+**You do not have to read the output to know whether it worked.** The exit
+status is the contract:
+
+| exit | meaning |
+|---|---|
+| `0` | everything selected actually happened |
+| `1` | the install did not achieve what it set out to — the last screen names what did not happen |
+| `2` | preflight refused, nothing was touched |
+
+So `sudo ./install.sh && sudo reboot` is safe: a failed install will not let you
+reboot into an unchanged system believing it worked.
+
 **What to expect.** The installer builds every module against *every* installed
-kernel, so you get one `✓` line per module per kernel:
+kernel, so you get one `✓` line per module per kernel, and each one is verified
+against the `.ko` that actually landed on disk — not against DKMS's exit code:
+
+On a machine with two installed kernels that is five modules x two kernels, ten
+lines:
 
 ```
 ==> Installing DKMS modules
-    ✓ hm1092 -> 7.1.4-2-cachyos
-    ✓ hm1092 -> 7.2.0-rc4-1-cachyos
-    ✓ intel-cvs -> 7.1.4-2-cachyos
+    ✓ <module> -> <kernel>  (verified: <ko names>)
+    ✓ <module> -> <other kernel>  (verified: <ko names>)
     ...
 ```
 
-Read those lines before you reboot. They are the only proof anything happened:
+The lines below are quoted exactly as the installer prints them — the package
+selftest fails if any of this wording drifts from install.sh:
 
 | line | meaning |
 |---|---|
-| `✓ <module> -> <kernel>` | built and installed for that kernel |
-| `! <module> failed for <kernel>` | build error — missing headers for *that* kernel is the usual cause |
-| `! <module> not found in package (looked in dkms/ and kernel/)` | **packaging bug — please report it.** Do not reboot expecting a fix; nothing was installed |
+| `✓ <module> -> <kernel>  (verified: <ko names>)` | built, installed, and the module file was found on disk for that kernel |
+| `✗ <module>: build FAILED for <kernel>` | build error — missing headers for *that* kernel is the usual cause. The run will exit non-zero |
+| `! <module>: installed for <n> kernel(s), FAILED for: <kernels>` | partial. Booting the failed kernels leaves the camera broken, so this also exits non-zero |
+| `✗ package is missing module '<name>' (no dkms/<name>-*/dkms.conf, no kernel/<name>/dkms.conf) — this clone/tarball is incomplete, re-download it` | **packaging bug — please report it.** This aborts in preflight with exit 2; nothing was touched |
+| `✗ NOTHING WAS INSTALLED. Do not reboot expecting a change — nothing would be different.` | the run achieved nothing and says so. Exit 1 |
 
-The psys section may legitimately say `ipu7-drivers DKMS not installed —
-skipping psys patches`. That is **fine and expected** if you do not have Intel's
-`ipu7-drivers` DKMS package (many distros ship IPU7 in-kernel). It is *not* a
-sign your DKMS install is broken. By contrast, `psys patch file not found in
-this package` is a packaging bug on our side — report that one.
+The psys section may legitimately say `! no ipu7-drivers package under DKMS ('dkms status' lists none, and /var/lib/dkms has none) — psys patches do not apply to this system`.
+That is **fine and expected** if you do not have Intel's `ipu7-drivers` DKMS
+package (many distros ship IPU7 in-kernel), and it does not affect the exit
+status. By contrast `✗ psys-suspend-BC.patch is not in this package (looked in dkms/ and kernel/ipu7-psys-patches/) — packaging bug, nothing to do with your DKMS install`
+is a bug on our side — report that one.
 
-## Step 3 — reboot
+## Step 3 — reboot, but only if step 2 succeeded
 
 ```bash
 sudo reboot
 ```
 
-**A reboot is required, not optional.** `hm1092` leaks module references and can
-never be swapped live: unbind succeeds, the refcount stays above zero, and
-`rmmod` reports the module in use.
+**Do not reboot after a failed install.** Nothing will have changed, and the
+reboot will look like the fix not working when in fact it was never applied.
+The installer's last screen tells you which it was, and so does `echo $?`.
+
+**A reboot is required, not optional** after a successful one. `hm1092` leaks
+module references and can never be swapped live: unbind succeeds, the refcount
+stays above zero, and `rmmod` reports the module in use.
 
 ---
 
@@ -176,60 +217,91 @@ never be swapped live: unbind succeeds, the refcount stays above zero, and
 sudo ./tools/verify.sh
 ```
 
-Run it as **root** — the live capture test is skipped otherwise.
+Run it as **root**. Without root the live capture test cannot run, and the
+script says `UNDETERMINED` rather than passing you on a check it never made.
 
-### What a HEALTHY machine prints
+**You do not have to interpret the output.** The last line is a single verdict
+and the exit status matches it:
+
+| last line | exit | meaning |
+|---|---|---|
+| `RESULT: OK — ...` | `0` | the camera stack is healthy **for the sensors this board has** |
+| `RESULT: BROKEN` | `1` | something is proven wrong. The lines under it name each one |
+| `RESULT: UNDETERMINED — ...` | `2` | nothing is proven broken, but some checks could not run (usually: not root, or `v4l-utils` / `libcamera-tools` not installed). This is **not** a pass |
+
+It only checks the sensors your board actually has. If you have no IR sensor —
+most RGB-only boards, including the OV05C10 machines — the IR section reads
+`n/a (no IR sensor on this board)` and the verdict is still `OK`. Nothing is
+missing; that half of the package simply does not apply to you.
+
+### What a HEALTHY RGB-only machine prints
 
 ```
-=== IPU7 IR stack verification — 7.2.0-rc4-1-cachyos ===
-  module intel_ipu7                  loaded
-  module intel_ipu7_isys             loaded
-  module intel_ipu7_psys             loaded
-  module intel_cvs                   loaded
-  module hm1092                      loaded
-  /dev/ipu7-psys0                    present          <-- the one that matters
-  loaded modules match disk          yes              <-- no stale initramfs copy
-  link_frequency                     180480000 (CORRECT)
-  psys suspend patches               2/2
-  IR flood LED                       present (=0)     <-- 0 is CORRECT when idle
-  howdy ir_reader                    installed
+-- IR camera / face unlock --
+  IR path                          n/a (no IR sensor on this board)
 
---- live IR capture (needs root) ---
-  SOF on csi2-2                      9 <-- STREAMING
+-- live IR capture --
+  capture test                     n/a (no IR sensor on this board)
+
+RESULT: OK — RGB camera working, no IR sensor on this board
 ```
 
-Three of those lines are routinely misread, so to be explicit:
+### What a HEALTHY machine with IR prints
 
-- **`/dev/ipu7-psys0 present`** is the load-bearing line for the RGB camera. If
-  it says `MISSING`, the camera will not work no matter what else looks good.
-- **`psys suspend patches 2/2` does NOT mean the psys stack is healthy.** It only
-  counts two *suspend* fixes inside the built module. It can read `2/2` while
-  `/dev/ipu7-psys0` is `MISSING` and the camera is completely dead. Always read
-  the `psys0` line first; `2/2` answers a different question. (This line is
-  absent entirely on distros that do not ship the DKMS psys module — also fine.)
-- **`IR flood LED present (=0)`** — `0` is correct. The illuminator is off in
-  standby by design and only lights during capture, matching Windows. A stock
-  implementation leaves it on 24/7.
+```
+=== IPU7 camera stack verification ===
+  kernel                           7.2.0-rc4-1-cachyos
+  fix-pack                         v0.9-12-g663f91b
 
-`link_frequency`, the LED and the capture lines only appear if you have the IR
-sensor. On an RGB-only board (e.g. OV05C10 machines) their absence is normal.
+-- core stack --
+  module intel_ipu7                loaded (kernel)
+  module intel_ipu7_psys           loaded (dkms)
+  /dev/ipu7-psys0                  present
+  loaded modules match disk        yes (7 checked)
+
+-- RGB camera --
+  module ov08x40                   loaded (kernel)
+  libcamera (cam --list)           2 camera(s)
+
+-- IR camera / face unlock --
+  module hm1092                    loaded (dkms)
+  link_frequency                   180480000 (correct)
+  IR flood LED                     present (brightness=0) — 0 is correct while idle
+
+-- live IR capture --
+  CSI-2 port                       2 (followed from hm1092 16-0024's own link)
+  SOF on csi2-2                    9 <-- STREAMING
+
+RESULT: OK — RGB camera working, IR camera streaming
+```
+
+The CSI-2 port, the capture node and the sensor names are read out of the media
+graph on your machine — port **1** on a Dell Pro 14, port **2** on an XPS 16, and
+the tool follows the link rather than assuming. If it cannot resolve them it
+prints `not tested` and refuses to run the capture, because a guessed port
+produces a confident `NO FRAMES` on a camera that is working.
 
 ### What a BROKEN machine prints
 
 ```
-  /dev/ipu7-psys0                    MISSING
-      -> intel_ipu7:      kernel
-      -> intel_ipu7_psys: dkms
-      -> split provenance means the defer check reads garbage. Fix:
-         sudo kernel/ipu7-psys-patches/fix-psys-defer.sh
-      -> kernel says:
+  /dev/ipu7-psys0                  MISSING — the RGB camera cannot work without it
+      intel_ipu7:      /lib/modules/<ver>/kernel/.../intel-ipu7.ko.zst  [kernel]
+      intel_ipu7_psys: /lib/modules/<ver>/updates/dkms/intel-ipu7-psys.ko.zst  [dkms]
+      -> SPLIT PROVENANCE: intel_ipu7 comes from your kernel package and
+         intel_ipu7_psys from DKMS. ...
+         Fix: sudo /home/you/svp7500-camera-fix-pack/dkms/ipu7-psys-patches/fix-psys-defer.sh
+      kernel says:
            intel_ipu7_psys: probe deferred
-      -> aux device: ABSENT (intel_ipu7 never created it)
-  STALE MODULES (loaded build != build on disk):
-      ipu_bridge  loaded=1a2b3c4d...  disk=9f8e7d6c...
-      -> the running kernel is NOT using what you just built.
-         Regenerate the initramfs and reboot:  sudo mkinitcpio -P
+      aux device: ABSENT (intel_ipu7 never created it)
+
+RESULT: BROKEN
+  * /dev/ipu7-psys0 does not exist — intel_ipu7_psys never bound
 ```
+
+The diagnosis is derived, not assumed: if both modules come from the same place
+this is *not* split provenance and it says so, and it will not offer you
+`fix-psys-defer.sh` unless `dkms status` actually lists an `ipu7-drivers` tree
+for it to patch.
 
 Two failure modes worth naming, because both cost real debugging hours:
 
@@ -258,9 +330,10 @@ For the IR node and CSI-2 port:
 ./tools/find-ir-node.sh
 ```
 
-It reports the CSI-2 port as either `auto-detected from the sensor's link` or
-`GUESSED — could not follow the sensor's link`. If it says GUESSED, the value is
-a fallback and probably wrong for your machine — include that output in a report.
+Everything it prints is followed from the sensor's own link in the media graph.
+If it cannot follow that link it prints `UNDETECTED — not guessing` and exits
+non-zero, rather than handing you a number that is right on somebody else's
+laptop.
 
 ---
 
@@ -292,9 +365,12 @@ sudo mkinitcpio -P      # or: dracut -f  /  update-initramfs -u
 sudo reboot
 ```
 
-The installer backs up anything it replaces: previous `/usr/src/<module>-<ver>`
-trees become `.bak-<timestamp>`, and Howdy's `video_capture.py` and
-`config.ini` are copied aside the same way before being touched.
+The installer backs up anything it replaces. A previous
+`/usr/src/<module>-<ver>` tree is moved to `/usr/src/<module>-<ver>.bak` — one
+backup at a fixed path, overwritten each run, so re-running does not fill
+`/usr/src` with copies. Howdy's `video_capture.py` and `config.ini`, and the
+vendor `ipu-psys.c` before each patch, get a timestamped `.bak-<date>-<time>`
+copy instead, because those are edited in place rather than replaced.
 
 ---
 
@@ -324,9 +400,24 @@ sensor). Every one of those was a wrong assumption baked into the tooling.
 
 ## If it does not work, what to send me
 
-Open an issue with the output of **all** of these. Every slow diagnosis so far
-started with a report missing one of them — most often the module paths, which
-are what reveal a stale or split-provenance install.
+First, run the package's own consistency check. It needs no hardware and no
+root, and it catches the class of bug where the download itself is wrong — a
+module the installer cannot find, a documented command that does not exist:
+
+```bash
+./tools/selftest.sh
+```
+
+If that fails, the package is broken rather than your machine, and the output
+tells you which file is missing. Include it and stop there.
+
+Otherwise, open an issue with the output of **all** of these. Every slow
+diagnosis so far started with a report missing one of them — most often the
+module paths, which are what reveal a stale or split-provenance install.
+
+Nothing below clears your kernel log. `verify.sh` used to run `dmesg -C`, which
+erased every boot-time probe message before step 5 could read it; it does not
+any more, so you can run these in order.
 
 ```bash
 # 1. the whole stack, one command (this is the important one)

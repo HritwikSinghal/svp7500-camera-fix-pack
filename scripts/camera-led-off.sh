@@ -141,5 +141,18 @@ fi
 # IR sensor: best effort (non-streaming anyway, keeps boot parity)
 echo i2c-HIMX1092:00 > /sys/bus/i2c/drivers/hm1092/bind 2>/dev/null || true
 
-[ "$RELAY_WAS_ACTIVE" = 1 ] && systemctl start "$RELAY"
-echo "Done. LED OFF until the next camera stream."
+if [ "$RELAY_WAS_ACTIVE" = 1 ]; then
+    if systemctl start "$RELAY"; then
+        echo "restarted $RELAY"
+    else
+        echo "WARNING: could not restart $RELAY — start it yourself: systemctl start $RELAY"
+    fi
+fi
+
+# The privacy LED is a one-way firmware latch with NO readable state: there is
+# no sysfs attribute to check. So this cannot claim the LED went out, only that
+# the thing that clears it was done. Saying "LED OFF" as a fact was a claim
+# about something this script never looked at.
+echo "Done: the bridge was power-cycled and ov05c10 re-bound."
+echo "Look at the LED. It should now be off until the next camera stream."
+echo "If it is still lit, the power-cycle did not reach the bridge — reboot."

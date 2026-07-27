@@ -127,13 +127,17 @@ install -m 0444 "\$HERE/howdy/ir_reader.py" /usr/lib/howdy/recorders/ir_reader.p
 patch -p0 -d / < "\$HERE/howdy/video_capture.patch"
 echo "==> Done"
 echo "   sudo \$HERE/verify.sh   check the whole stack"
+bad "package is missing module 'x' — this clone/tarball is incomplete, re-download it"
 EOF
     printf 'PACKAGE_NAME="demo"\nPACKAGE_VERSION="1.0"\nBUILT_MODULE_NAME[0]="demo"\n' > "$1/dkms/demo-1.0/dkms.conf"
     printf 'MAKE[0]="make -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build modules"\n' \
       >> "$1/dkms/demo-1.0/dkms.conf"
     printf 'obj-m += demo.o\n' > "$1/dkms/demo-1.0/Makefile"
     : > "$1/dkms/demo-1.0/demo.c"
-    printf '# demo\nkernels 1.0 through 2.0\n\nAfter the reboot:\n\n    sudo ./tools/verify.sh\n' > "$1/README.md"
+    { printf '# demo\nkernels 1.0 through 2.0\n\nAfter the reboot:\n\n    sudo ./tools/verify.sh\n'
+      printf '\n| line | meaning |\n|---|---|\n'
+      printf '| `✗ package is missing module '"'"'<name>'"'"' — this clone/tarball is incomplete, re-download it` | packaging bug |\n'
+    } > "$1/README.md"
     printf 'ACTION=="add", KERNEL=="flash*", MODE="0660"\n' > "$1/udev/99-hm1092-ir-led.rules"
     printf 'class ir_reader:\n    pass\n' > "$1/howdy/ir_reader.py"
     printf -- '--- a/video_capture.py\n+++ b/video_capture.py\n' > "$1/howdy/video_capture.patch"
@@ -219,6 +223,16 @@ EOF
   d=$(mutate make-line-bogus)
   sed -i 's|/build modules|/build/src modules|' "$d/dkms/demo-1.0/dkms.conf"
   expect_fail "$d" "is not in this package" "a MAKE[0] M= path that does not exist in the package"
+
+  # 8. The README's decode table quoting a message the installer does not print.
+  #    That table is the user's only key for telling a real install from a no-op,
+  #    and it shipped quoting three strings install.sh never produced: you
+  #    Ctrl-F the README's wording, find nothing, and cannot tell which row you
+  #    are in. Reword the installer and this must fail on the next push.
+  d=$(mutate readme-quotes-drifted)
+  sed -i 's|this clone/tarball is incomplete, re-download it|this download is incomplete, get it again|' "$d/install.sh"
+  expect_fail "$d" "installer output that install.sh never prints" \
+    "a README decode table quoting a message the installer does not print"
 
   exit $rc
 fi
@@ -668,27 +682,47 @@ SHELL_ENV=' HOME PATH USER LOGNAME EUID UID PWD OLDPWD IFS SHELL TERM LANG LC_AL
  OPTARG OPTIND CDPATH TMPDIR SUDO_USER SUDO_UID DISPLAY XDG_RUNTIME_DIR EDITOR NO_COLOR
  KERNELRELEASE KERNEL_SRC KVER KBUILD MAKE CC LD DESTDIR
  dkms_tree kernel_source_dir PACKAGE_NAME PACKAGE_VERSION '
-CODE=$(mktemp); trap 'rm -f "$CODE"' EXIT
+# A script that SOURCES another file in this package inherits its variables, so
+# reading one of them is not an unset read. verify.sh and find-ir-node.sh get
+# every LD_* name from tools/lib-detect.sh this way, and install.sh gets the
+# HW_* names from tools/check-hardware.sh. Without this the check would demand
+# that a library's callers redeclare its interface -- a false failure, which is
+# how a useful check gets deleted.
+sourced_files(){
+  grep -oE '(^|[[:space:]])(\.|source)[[:space:]]+"?\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/[A-Za-z0-9_./-]+' "$1" \
+    | sed -E 's@.*\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/@@' \
+    | while read -r p; do [[ -f $ROOT/$p ]] && printf '%s\n' "$ROOT/$p"; done
+}
+
+CODE=$(mktemp); CODEA=$(mktemp); trap 'rm -f "$CODE" "$CODEA"' EXIT
 for s in "${SCRIPTS[@]}"; do
   grep -qE '^[[:space:]]*set[[:space:]]+-[a-z]*u|set -o nounset' "$s" || continue
   # Blank out whole-line comments, keeping the line count so reported line
   # numbers still match the real file. Prose about a variable is not a use of
   # it -- and this file's own comments discuss the very typos it hunts for.
   sed 's/^[[:space:]]*#.*//' "$s" > "$CODE"
+  # $CODE  = this script alone, for the USES and the line numbers.
+  # $CODEA = this script plus whatever it sources, for the ASSIGNMENTS.
+  cp "$CODE" "$CODEA"; inherited=""
+  while read -r sf; do
+    [[ -n $sf ]] || continue
+    sed 's/^[[:space:]]*#.*//' "$sf" >> "$CODEA"
+    inherited+=" $(rel "$sf")"
+  done < <(sourced_files "$s")
   assigned=" $( {
       # NAME=, export/local/declare/readonly NAME=, NAME[key]=, NAME+=(
-      grep -oE '(^|[[:space:]]|;|&|\|)(export|local|readonly|declare|typeset)?[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=' "$CODE" \
+      grep -oE '(^|[[:space:]]|;|&|\|)(export|local|readonly|declare|typeset)?[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=' "$CODEA" \
         | grep -oE '[A-Za-z_][A-Za-z0-9_]*(\[|\+?=)' | sed -E 's/(\[|\+?=)$//'
       # bare declarations: local a b c / declare -A x
-      grep -oE '(^|[[:space:]])(local|declare|typeset|readonly)([[:space:]]+-[a-zA-Z]+)*[[:space:]]+[A-Za-z0-9_ ]+' "$CODE" \
+      grep -oE '(^|[[:space:]])(local|declare|typeset|readonly)([[:space:]]+-[a-zA-Z]+)*[[:space:]]+[A-Za-z0-9_ ]+' "$CODEA" \
         | sed -E 's/.*(local|declare|typeset|readonly)([[:space:]]+-[a-zA-Z]+)*[[:space:]]+//' | tr ' ' '\n'
-      grep -oE '(^|[;&|][[:space:]]*|[[:space:]])for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "$CODE" | awk '{print $NF}'
+      grep -oE '(^|[;&|][[:space:]]*|[[:space:]])for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "$CODEA" | awk '{print $NF}'
       # read [-flags] a b c  -- every name, not just the first
-      grep -oE '(^|[[:space:]|;])read[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*[A-Za-z_][A-Za-z0-9_ ]*' "$CODE" \
+      grep -oE '(^|[[:space:]|;])read[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*[A-Za-z_][A-Za-z0-9_ ]*' "$CODEA" \
         | sed -E 's/.*read[[:space:]]+//; s/(-[a-zA-Z]+[[:space:]]+)*//' | tr ' ' '\n'
-      grep -oE 'mapfile[^|<]*[[:space:]][A-Za-z_][A-Za-z0-9_]*' "$CODE" | awk '{print $NF}'
-      grep -oE 'printf[[:space:]]+-v[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "$CODE" | awk '{print $NF}'
-      grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*:?=' "$CODE" | tr -d '${:='
+      grep -oE 'mapfile[^|<]*[[:space:]][A-Za-z_][A-Za-z0-9_]*' "$CODEA" | awk '{print $NF}'
+      grep -oE 'printf[[:space:]]+-v[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "$CODEA" | awk '{print $NF}'
+      grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*:?=' "$CODEA" | tr -d '${:='
       # function parameters are positional, never named
     } | sort -u | tr '\n' ' ' ) "
   bad=""; lines=""
@@ -706,7 +740,7 @@ for s in "${SCRIPTS[@]}"; do
   if [[ -n $bad ]]; then
     fail "$(rel "$s"): reads unset variable(s):$bad — under 'set -u' the script aborts there" "${lines%$'\n'}"
   else
-    pass "$(rel "$s"): no unset-variable exit"
+    pass "$(rel "$s"): no unset-variable exit${inherited:+ (inherits:$inherited)}"
   fi
 done
 
@@ -762,6 +796,94 @@ if grep -q 'dkms remove' "$README"; then
 else
   warn "README has no 'dkms remove' recovery block" \
        "a stranger who breaks their camera has no documented way back"
+fi
+
+# ===========================================================================
+section "the README quotes the installer's REAL output"
+# The README's "what to expect" table is the only key a user has for telling a
+# real install from a no-op, and it used to quote three lines install.sh never
+# prints -- e.g. "! <module> not found in package (looked in dkms/ and kernel/)"
+# against an installer that actually says "package is missing module 'hm1092'
+# ... this clone/tarball is incomplete, re-download it". Ctrl-F finds nothing
+# and the reader cannot tell which row of the table they are in.
+#
+# Every README string that starts with one of the installer's own glyphs is
+# checked here. <placeholders> are cut out, and each remaining literal run has
+# to appear verbatim in install.sh. Reword a message and this fails on the next
+# push, which is the only thing that keeps a decode table honest.
+#
+# Two kinds of quotation, held to two standards:
+#   TPL    — a backtick-quoted message TEMPLATE, i.e. a row of the decode table.
+#            Every literal run between <placeholders> must be in install.sh.
+#            This is the one that shipped wrong, so a mismatch is a FAIL.
+#   SAMPLE — a line inside a fenced transcript. It carries one machine's real
+#            kernel and module names, so it cannot match verbatim; it only has
+#            to share SOME run of words with install.sh, or it is a transcript
+#            of a program this package does not contain.
+sq(){ tr -s ' \t' ' ' ; }                       # whitespace-insensitive compare
+INSTALL_SQ=$(mktemp); sq < "$INSTALL" > "$INSTALL_SQ"
+n_quoted=0
+while IFS='|' read -r kind q; do
+  [[ -z ${q:-} ]] && continue
+  n_quoted=$((n_quoted+1))
+  bare=$(printf '%s' "$q" | sed -E 's/^[[:space:]]*(✓|✗|!|·)[[:space:]]+//')
+  short=$(printf '%s' "$q" | cut -c1-58)
+  if [[ $kind == TPL ]]; then
+    missing=(); checked=0
+    while IFS= read -r seg; do
+      seg=$(printf '%s' "$seg" | sq); seg=${seg#" "}; seg=${seg%" "}
+      [[ ${#seg} -ge 8 ]] || continue
+      checked=$((checked+1))
+      grep -qF -- "$seg" "$INSTALL_SQ" || missing+=("$seg")
+      # printf '%s\n', not '%s': without the trailing newline `read` returns
+      # non-zero on the final segment and the loop body never runs for it. Every
+      # quote made of ONE literal run -- which is every exact message in the
+      # table -- then scored checked=0 and was reported as "all placeholders,
+      # nothing to check". The drift check that exists to keep the README honest
+      # was checking nothing, and saying so as a warning.
+    done < <(printf '%s\n' "$bare" | sed -E 's/<[^>]*>/\n/g')
+    if [[ $checked -eq 0 ]]; then
+      warn "README quotes '$short' but every part of it is a <placeholder>" \
+           "nothing in that row can be checked against install.sh, so it can drift freely"
+    elif [[ ${#missing[@]} -gt 0 ]]; then
+      fail "README quotes installer output that install.sh never prints: '$q'" \
+           "not found in install.sh: $(printf "'%s' " "${missing[@]}")" \
+           "a reader who Ctrl-Fs the README's wording finds nothing and cannot tell which case they are in"
+    else
+      pass "README's '$short' matches install.sh"
+    fi
+  else
+    # the longest run of consecutive words that install.sh also contains
+    read -ra W <<<"$bare"
+    hit=""; len=${#W[@]}
+    while [[ $len -gt 0 && -z $hit ]]; do
+      i=0
+      while [[ $((i + len)) -le ${#W[@]} ]]; do
+        cand="${W[*]:i:len}"
+        if [[ ${#cand} -ge 10 ]] && grep -qF -- "$cand" "$INSTALL_SQ"; then hit=$cand; break; fi
+        i=$((i+1))
+      done
+      len=$((len-1))
+    done
+    if [[ -n $hit ]]; then
+      pass "README sample '$short' shares wording with install.sh"
+    else
+      warn "README shows a sample line install.sh has nothing in common with: '$q'" \
+           "either the installer was reworded or this transcript came from another program"
+    fi
+  fi
+done < <( {
+    # backtick-quoted spans starting with an installer glyph = TEMPLATES
+    grep -oE '`[[:space:]]*(✓|✗|!|·) [^`]*`' "$README" | sed -E 's/^`//; s/`$//; s/^/TPL|/'
+    # the same lines inside a fenced code block = one machine's TRANSCRIPT
+    awk '/^```/{f=!f; next} f && /^[[:space:]]*(✓|✗|!|·) /{print "SAMPLE|" $0}' "$README"
+  } | sort -u )
+rm -f "$INSTALL_SQ"
+if [[ $n_quoted -eq 0 ]]; then
+  warn "the README quotes no installer output at all" \
+       "a user has nothing to compare their run against, which is how a no-op passed for a success"
+else
+  info "$n_quoted quoted installer line(s) checked against install.sh"
 fi
 
 # ===========================================================================

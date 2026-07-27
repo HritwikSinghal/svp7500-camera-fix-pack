@@ -40,11 +40,41 @@ set -euo pipefail
 
 SRC="${1:-}"
 if [[ -z $SRC ]]; then
-  # Pick the tree DKMS actually HAS INSTALLED. `ls | tail -1` grabs a stale
-  # leftover tree and silently patches source that is never built.
-  V=$(dkms status 2>/dev/null | sed -n 's|^ipu7-drivers/\([^,]*\),.*installed.*|\1|p' | head -1)
-  [[ -n ${V:-} ]] || { echo "ipu7-drivers not installed under DKMS; pass the source dir"; exit 1; }
-  SRC=/usr/src/ipu7-drivers-$V
+  # Pick the tree DKMS actually HAS. `ls | tail -1` grabs a stale leftover tree
+  # and silently patches source that is never built.
+  #
+  # Parse BOTH `dkms status` formats. dkms >= 3 prints
+  #     ipu7-drivers/0.0.r74, 7.1.4, x86_64: installed
+  # and dkms 2.x (Ubuntu 22.04, older Debian) prints
+  #     ipu7-drivers, 0.0.r74, 7.1.4, x86_64: installed
+  # Reading only the first told every Ubuntu user "ipu7-drivers not installed
+  # under DKMS" and sent them away with a dead camera and nothing to try.
+  V=$(dkms status 2>/dev/null | sed -nE 's|^ipu7-drivers[/,] *([^,:]+).*|\1|p' | head -1)
+  if [[ -z ${V:-} ]]; then
+    # dkms status can be empty while the tree is right there (a registration
+    # dropped by a package upgrade, for one). Look before saying no.
+    for d in /var/lib/dkms/ipu7-drivers/*/; do
+      [[ -d $d ]] || continue
+      b=${d%/}; b=${b##*/}
+      [[ $b == kernel-* ]] && continue
+      [[ -e ${d%/}/source ]] || continue
+      V=$b; break
+    done
+  fi
+  [[ -n ${V:-} ]] || {
+    echo "no ipu7-drivers under DKMS ('dkms status' lists none, and /var/lib/dkms has none)."
+    echo "If your intel_ipu7_psys came from your kernel package rather than DKMS,"
+    echo "this script does not apply -- there is no source tree here to patch."
+    echo "Otherwise pass the source directory:  sudo $0 /usr/src/ipu7-drivers-rNN.xxxxx"
+    exit 1
+  }
+  # Resolve through DKMS's own source link where possible: the tree is not
+  # always at the /usr/src/<name>-<version> path the version string implies.
+  if [[ -e /var/lib/dkms/ipu7-drivers/$V/source ]]; then
+    SRC=$(readlink -f "/var/lib/dkms/ipu7-drivers/$V/source")
+  else
+    SRC=/usr/src/ipu7-drivers-$V
+  fi
 fi
 
 F="$SRC/drivers/media/pci/intel/ipu7/psys/ipu-psys.c"
@@ -73,11 +103,14 @@ Now rebuild for EVERY installed kernel, not just the running one -- building
 only $(uname -r) leaves the others with an unpatched psys and a dead camera
 after the next boot into them:
 
-    V=$(dkms status | sed -n 's|^ipu7-drivers/\([^,]*\),.*installed.*|\1|p' | head -1)
+    V=$(dkms status | sed -nE 's|^ipu7-drivers[/,] *([^,:]+).*|\1|p' | head -1)
     for k in $(ls /lib/modules); do
       [ -d /lib/modules/$k/build ] || continue
-      dkms remove  ipu7-drivers/$V -k $k
-      dkms install ipu7-drivers/$V -k $k
+      # --force, NOT remove-then-install: `dkms remove` deletes the psys module
+      # that is working right now, and the build that follows has just had its
+      # source patched, so it is more likely than usual to fail. That sequence
+      # leaves you with no psys module at all.
+      dkms install --force ipu7-drivers/$V -k $k
     done
 
 Then REBOOT. Do not modprobe -r intel_ipu7_psys to pick it up live: unloading

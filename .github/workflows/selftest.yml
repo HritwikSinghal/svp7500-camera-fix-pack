@@ -68,3 +68,66 @@ jobs:
       - name: install.sh --help must work from the archive
         working-directory: /tmp/asif
         run: ./install.sh --help
+
+  refuses-wrong-hardware:
+    name: the tools must refuse a machine that is not a candidate
+    runs-on: ubuntu-latest
+    # A CI runner is the perfect stranger's-laptop: no IPU7, no CVS bridge, no
+    # camera of any kind. Every tool here must SAY SO and exit non-zero. The
+    # whole point of this package's rewrite is that a run which achieved nothing
+    # never reports success, and this is the only job that exercises install.sh
+    # past --help, so the dry-run path cannot quietly rot.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install the toolchain so hardware is the ONLY thing missing
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq dkms kmod patch clang lld llvm
+
+      - name: check-hardware.sh must say no
+        run: |
+          set +e
+          out=$(./tools/check-hardware.sh); rc=$?
+          printf '%s\n' "$out"
+          [ "$rc" -ne 0 ] || { echo "FAIL: check-hardware.sh accepted a runner with no IPU7"; exit 1; }
+          grep -q 'APPLIES TO THIS MACHINE: no' <<<"$out" \
+            || { echo "FAIL: no verdict line naming this machine as unsupported"; exit 1; }
+
+      - name: install.sh --dry-run must refuse, with exit 2 and a reason
+        run: |
+          set +e
+          out=$(sudo ./install.sh --dry-run 2>&1); rc=$?
+          printf '%s\n' "$out"
+          [ "$rc" -eq 2 ] || { echo "FAIL: expected preflight refusal (exit 2), got $rc"; exit 1; }
+          grep -q 'no supported board found' <<<"$out" \
+            || { echo "FAIL: refused without naming the hardware as the reason"; exit 1; }
+          grep -q 'nothing was changed' <<<"${out,,}" \
+            || { echo "FAIL: did not state that nothing was changed"; exit 1; }
+
+      - name: install.sh must never print Done on a run that installed nothing
+        run: |
+          set +e
+          out=$(sudo ./install.sh --dry-run 2>&1)
+          grep -q '==> Done' <<<"$out" \
+            && { echo "FAIL: printed Done on a machine where it refused to run"; exit 1; }
+          exit 0
+
+      - name: verify.sh must never report OK with no camera present
+        run: |
+          set +e
+          out=$(sudo ./tools/verify.sh 2>&1); rc=$?
+          printf '%s\n' "$out"
+          grep -q 'RESULT: OK' <<<"$out" \
+            && { echo "FAIL: verify.sh reported OK on a machine with no camera"; exit 1; }
+          [ "$rc" -ne 0 ] || { echo "FAIL: verify.sh exited 0 with no camera"; exit 1; }
+          grep -qE 'RESULT: (BROKEN|UNDETERMINED)' <<<"$out" \
+            || { echo "FAIL: verify.sh printed no verdict at all"; exit 1; }
+
+      - name: find-ir-node.sh must refuse to guess
+        run: |
+          set +e
+          out=$(./tools/find-ir-node.sh 2>&1); rc=$?
+          printf '%s\n' "$out"
+          [ "$rc" -ne 0 ] || { echo "FAIL: find-ir-node.sh exited 0 with no media device"; exit 1; }
+          grep -qiE 'GUESS' <<<"$out" \
+            && { echo "FAIL: find-ir-node.sh guessed a value"; exit 1; }
+          exit 0

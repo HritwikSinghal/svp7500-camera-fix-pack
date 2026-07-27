@@ -332,61 +332,42 @@ fi
 # harmless: int3472-patched and ipu-bridge-patched are replacements for IN-TREE
 # modules and land in updates/, which depmod prefers over kernel/ -- so on an
 # unrelated Intel MIPI laptop this would override working drivers system-wide.
-HW_BRIDGE="" HW_ACPI="" HW_SENSORS="" HW_IPU="" HW_IPU6=0
-detect_hardware(){
-  local d v p drv
-  # 1) the Synaptics CVS bridge on USB (06cb:0701 and its siblings)
-  for d in /sys/bus/usb/devices/*/; do
-    [[ -f $d/idVendor && -f $d/idProduct ]] || continue
-    v=$(cat "$d/idVendor" 2>/dev/null || true)
-    p=$(cat "$d/idProduct" 2>/dev/null || true)
-    if [[ $v == 06cb ]]; then HW_BRIDGE="06cb:$p"; break; fi
-  done
-  # 2) the bridge's ACPI id — INTC10CF/DE/E0/E1 = MTL/LNL/ARL/PTL
-  HW_ACPI=$( { ls /sys/bus/i2c/devices/ /sys/bus/acpi/devices/ 2>/dev/null || true; } \
-             | grep -oiE 'INTC10(CF|DE|E0|E1)' | sort -u | tr '\n' ' ') || true
-  # 3) the sensors and the GPIO/power controller the firmware declares
-  HW_SENSORS=$( { ls /sys/bus/acpi/devices/ 2>/dev/null || true; } \
-             | grep -oiE 'HIMX1092|OVTI08F4|OVTI05C1|INT3472' | sort -u | tr '\n' ' ') || true
-  # 4) the IPU itself, and whether this is an IPU6 machine (not ours)
-  for d in /sys/bus/pci/devices/*/; do
-    [[ -f $d/vendor && -f $d/class ]] || continue
-    [[ $(cat "$d/vendor" 2>/dev/null || true) == 0x8086 ]] || continue
-    case $(cat "$d/class" 2>/dev/null || true) in
-      0x0480*) HW_IPU="${d%/}"; HW_IPU="${HW_IPU##*/} $(cat "$d/device" 2>/dev/null || true)" ;;
-      *) continue ;;
-    esac
-    if [[ -e $d/driver ]]; then
-      drv=$(basename "$(readlink -f "$d/driver")")
-      case $drv in intel-ipu6*|intel_ipu6*) HW_IPU6=1 ;; esac
-    fi
-  done
-  [[ -d /sys/module/intel_ipu6 ]] && HW_IPU6=1
-  return 0
-}
-detect_hardware
-[[ -n $HW_BRIDGE  ]] && ok "CVS bridge on USB: $HW_BRIDGE"
-[[ -n $HW_ACPI    ]] && ok "bridge ACPI id: $HW_ACPI"
-[[ -n $HW_SENSORS ]] && ok "sensors declared by firmware: $HW_SENSORS"
-[[ -n $HW_IPU     ]] && ok "Intel imaging unit on PCI: $HW_IPU"
-HW_OK=0
-if [[ -n $HW_BRIDGE || -n $HW_ACPI ]] && [[ -n $HW_SENSORS ]]; then HW_OK=1; fi
-if [[ $HW_IPU6 -eq 1 ]]; then
-  if [[ $FORCE -eq 1 ]]; then
-    warn "this is an IPU6 machine (intel_ipu6 is bound/loaded) and --force was given — this package REPLACES ipu_bridge and intel_skl_int3472 system-wide and can break a working IPU6 camera"
-    action "if your camera stops working, back this out: see the 'dkms remove' block in the README"
-  else
-    pf_bad "this is an IPU6 machine (intel_ipu6 is bound/loaded). This package is for IPU7 and its ipu-bridge/int3472 replacements would override the in-tree modules your camera uses. Nothing was changed. (--force overrides, at your own risk.)"
-  fi
-elif [[ $HW_OK -eq 0 ]]; then
-  if [[ $FORCE -eq 1 ]]; then
-    warn "no SVP7500 bridge and no IPU7 sensor found on this machine — --force was given, continuing anyway"
-    action "this machine did not look like a supported board; if the camera does not work, back the package out (README 'dkms remove' block) rather than debugging it"
-  else
-    pf_bad "this machine does not look like a supported board. Looked for: a Synaptics CVS bridge on USB (06cb:*), a bridge ACPI id (INTC10CF/DE/E0/E1) under /sys/bus/{i2c,acpi}/devices, and a sensor id (HIMX1092/OVTI08F4/OVTI05C1/INT3472). Found bridge='${HW_BRIDGE:-none}' acpi='${HW_ACPI:-none}' sensors='${HW_SENSORS:-none}'. Nothing was changed — re-run with --force if you know better."
-  fi
+#
+# The detection lives in tools/check-hardware.sh, which a stranger can also run
+# on its own before cloning anything -- one command instead of the README's old
+# five commands and two cross-referenced tables. One implementation, so the
+# script that answers "is this for my laptop?" and the installer that enforces
+# the answer can never disagree.
+if [[ ! -f "$HERE/tools/check-hardware.sh" ]]; then
+  pf_bad "package is missing tools/check-hardware.sh — this clone/tarball is incomplete, re-download it"
 else
-  ok "hardware: this machine looks like a supported board"
+  # shellcheck source=/dev/null
+  . "$HERE/tools/check-hardware.sh"
+  detect_hardware
+  [[ -n $HW_BRIDGE  ]] && ok "CVS bridge on USB: $HW_BRIDGE"
+  [[ -n $HW_ACPI    ]] && ok "bridge ACPI id: $HW_ACPI"
+  [[ -n $HW_SENSORS ]] && ok "sensors declared by firmware: $HW_SENSORS"
+  [[ -n $HW_IPU     ]] && ok "Intel imaging unit on PCI: $HW_IPU"
+  HW_RC=0; hw_verdict || HW_RC=$?
+  case $HW_RC in
+    0) ok "hardware: this machine looks like a supported board" ;;
+    2)
+      if [[ $FORCE -eq 1 ]]; then
+        warn "$HW_REASON --force was given, continuing — this package REPLACES ipu_bridge and intel_skl_int3472 system-wide and can break a working IPU6 camera"
+        action "if your camera stops working, back this out: see the 'dkms remove' block in the README"
+      else
+        pf_bad "$HW_REASON Nothing was changed. (--force overrides, at your own risk.)"
+      fi
+      ;;
+    *)
+      if [[ $FORCE -eq 1 ]]; then
+        warn "$HW_REASON --force was given, continuing anyway"
+        action "this machine did not look like a supported board; if the camera does not work, back the package out (README 'dkms remove' block) rather than debugging it"
+      else
+        pf_bad "$HW_REASON Nothing was changed — run $HERE/tools/check-hardware.sh for the detail, or re-run with --force if you know better."
+      fi
+      ;;
+  esac
 fi
 
 # --- Secure Boot ------------------------------------------------------------
@@ -580,10 +561,38 @@ install_module(){
     return 0
   fi
 
-  if dkms status 2>/dev/null | grep -q "^${m}[/,] *${ver}"; then
+  # Register the tree with DKMS -- WITHOUT tearing down what is installed now.
+  #
+  # This used to be an unconditional `dkms remove ... --all` followed by an
+  # install. `dkms remove` deletes the .ko files that are working at this
+  # moment; if the build that follows then fails, the machine is left with NO
+  # module at all -- strictly worse than before the installer ran, and on the
+  # second run of a script users are explicitly told to re-run. Verified: a
+  # re-run whose builds fail wipes every previously-installed module.
+  #
+  # `dkms install --force` rebuilds and replaces in place with no window where
+  # nothing is installed, and it reads the source through
+  # /var/lib/dkms/<m>/<ver>/source, which is a symlink to the /usr/src tree we
+  # have just refreshed. So the ONLY case that still needs a remove is a stale
+  # registration whose source symlink points somewhere else entirely -- there,
+  # not removing would silently rebuild a different tree.
+  #
+  # `readlink -f` prints a canonical path even when the file is NOT there (it
+  # only needs the parent to exist), so the -e test is load-bearing: without it
+  # a module DKMS has never heard of compares "different" and gets removed --
+  # the destructive path, on the case that needs it least.
+  local reg_src="" want_src=""
+  if [[ -e /var/lib/dkms/${m}/${ver}/source ]]; then
+    reg_src=$(readlink -f "/var/lib/dkms/${m}/${ver}/source" 2>/dev/null || true)
+  fi
+  want_src=$(readlink -f "$dst" 2>/dev/null || true)
+  if [[ -n $reg_src && -n $want_src && $reg_src != "$want_src" ]]; then
     had_prior=1
+    warn "$m: DKMS has $ver registered against $reg_src, not $dst — re-registering it (the currently installed $m is removed to do so)"
     run_quiet dkms remove "${m}/${ver}" --all || true
   fi
+  # Already-added is not an error: dkms says so and exits non-zero, and the
+  # install below rebuilds from the refreshed source either way.
   run_quiet dkms add "${m}/${ver}" || true
 
   # Build for EVERY installed kernel. Building only $(uname -r) has repeatedly
@@ -678,9 +687,26 @@ install_module(){
       SKIPPED_NOTES+=("optional module $m failed to build for every kernel (harmless unless your RGB sensor is OV05C10)")
     fi
     if [[ ${#badkernels[@]} -gt 0 ]]; then KFAIL_NOTES+=("$m did not build for: ${badkernels[*]}"); fi
-    if [[ $had_prior -eq 1 && $DRY_RUN -eq 0 ]]; then
-      bad "$m: not installed for ANY kernel — and the previous registration was removed to make room, so $m is NOT installed at all right now"
-      action "$m is not installed for any kernel; the previous copy was replaced. Fix the build error above and re-run before rebooting"
+    # Say which of the two situations this is, because they need different
+    # things from the user. Either an older build is still on disk and the
+    # machine is no worse than before, or there is now nothing at all -- and
+    # claiming the wrong one is its own failure: a user told "NOT installed at
+    # all" panics over a working camera, and one told "the old build is still
+    # there" when it is not reboots into a dead one.
+    local -a still=()
+    if [[ $DRY_RUN -eq 0 ]]; then
+      for k in "${KERNELS[@]}"; do
+        for n in "${names[@]}"; do
+          ko_present "$k" "$n" >/dev/null && { still+=("$k"); break; }
+        done
+      done
+    fi
+    if [[ ${#still[@]} -gt 0 ]]; then
+      bad "$m: this run installed it for NO kernel. An EARLIER build of $m is still on disk for: ${still[*]} — nothing was removed, so those kernels keep what they had, but they do NOT have what this package ships"
+      action "$m did not build; ${still[*]} still carry the previous build of it. Fix the build error above and re-run"
+    elif [[ $had_prior -eq 1 && $DRY_RUN -eq 0 ]]; then
+      bad "$m: not installed for ANY kernel — and its previous registration had to be replaced, so $m is NOT installed at all right now"
+      action "$m is not installed for any kernel and the previous copy is gone. Fix the build error above and re-run BEFORE rebooting"
     else
       bad "$m: not installed for ANY kernel"
     fi
@@ -943,10 +969,40 @@ if [[ $PSYS_TREE_OK -eq 1 ]]; then
     # the machine with no psys module at all -- strictly worse than before this
     # installer ran.
     if dkms install --force "ipu7-drivers/$SRC" -k "$k" >/dev/null 2>&1; then
-      if ko_present "$k" intel-ipu7-psys >/dev/null || ko_present "$k" intel_ipu7_psys >/dev/null; then
-        ok "ipu7-drivers -> $k  (verified: intel_ipu7_psys)"
+      # Prove it from disk, and take the names from the vendor tree's OWN
+      # dkms.conf rather than guessing two spellings of "psys": a revision that
+      # names it something else made this print a shrug ("check what this
+      # revision names its psys module") for a step whose success was never
+      # established. Nothing may pass on a check that did not happen.
+      # NOT `local`: this loop is at top level, not inside a function, and
+      # `local` there exits 1 -- which under `set -e` kills the script between
+      # the psys step and the summary. An install that stops with no verdict is
+      # the quiet version of the bug this whole script exists to prevent.
+      psysnames=(); psysmissing=()
+      if [[ -f $IPUSRC/dkms.conf ]]; then
+        mapfile -t psysnames < <(built_module_names "$IPUSRC")
+      fi
+      if [[ ${#psysnames[@]} -eq 0 ]]; then
+        psysnames=(intel-ipu7-psys intel_ipu7_psys)
+        # Any one of the fallback spellings is enough; they are the same module.
+        if ko_present "$k" intel-ipu7-psys >/dev/null || ko_present "$k" intel_ipu7_psys >/dev/null; then
+          ok "ipu7-drivers -> $k  (verified: intel_ipu7_psys)"
+        else
+          IPU7_REBUILD_FAIL=$((IPU7_REBUILD_FAIL+1))
+          bad "ipu7-drivers -> $k: dkms reported success but no psys module is under /lib/modules/$k/{updates,extra,weak-updates}, and $IPUSRC has no dkms.conf to say what it should be called — this rebuild cannot be confirmed, so treat it as FAILED"
+          action "check what ipu7-drivers-$SRC builds and where it installs it; nothing verifiable landed for $k"
+        fi
       else
-        warn "ipu7-drivers -> $k: built, but no intel_ipu7_psys .ko under /lib/modules/$k/{updates,extra} — check what this revision names its psys module"
+        for n in "${psysnames[@]}"; do
+          ko_present "$k" "$n" >/dev/null || psysmissing+=("$n")
+        done
+        if [[ ${#psysmissing[@]} -eq 0 ]]; then
+          ok "ipu7-drivers -> $k  (verified: ${psysnames[*]})"
+        else
+          IPU7_REBUILD_FAIL=$((IPU7_REBUILD_FAIL+1))
+          bad "ipu7-drivers -> $k: dkms reported success but ${psysmissing[*]} is not under /lib/modules/$k/{updates,extra,weak-updates} — the patched psys source is NOT in what $k will load"
+          action "ipu7-drivers built for $k without installing ${psysmissing[*]}; the psys fixes are not in effect there"
+        fi
       fi
     else
       IPU7_REBUILD_FAIL=$((IPU7_REBUILD_FAIL+1))
@@ -1252,7 +1308,11 @@ if [[ $DO_KERNEL -eq 1 ]]; then
   # A patch that did not apply is also something that did not happen, and it
   # must not hide behind a green module count.
   if [[ $IPU7_REBUILD_FAIL -gt 0 ]]; then
-    bad "ipu7-drivers did not rebuild for ${IPU7_REBUILD_FAIL} kernel(s) — the patched psys source is not in the modules those kernels will load."
+    # "did not rebuild" would be too narrow: this counter also covers a build
+    # that dkms called a success but whose psys module could not be found on
+    # disk. Both mean the same thing to the user and neither may pass, but the
+    # summary must not assert the one that did not happen.
+    bad "ipu7-drivers did not produce a verified psys module for ${IPU7_REBUILD_FAIL} kernel(s) — the patched psys source is not in what those kernels will load (see the lines above for which case it was)."
     RC=1
   fi
   if [[ $PATCH_FAIL -gt 0 ]]; then
