@@ -167,8 +167,22 @@ if [ -e /dev/ipu7-psys0 ]; then
   p "/dev/ipu7-psys0" "present"
   PSYS_OK=1
 else
-  p "/dev/ipu7-psys0" "MISSING — the RGB camera cannot work without it"
-  broke "/dev/ipu7-psys0 does not exist — intel_ipu7_psys never bound"
+  # NOT "the RGB camera cannot work without it". That was false and it cost a
+  # reporter six rounds. Measured 2026-07-27 on hardware with psys0 PRESENT:
+  # libcamera reports both cameras on the "simple" pipeline handler, byte-identical
+  # to a machine where psys0 is absent; nothing holds /dev/ipu7-psys0 open; there
+  # is no IPU7 pipeline handler in libcamera at all (only ipu3, soft, vimc); and
+  # RGB capture through "simple" yields live frames. psys is the hardware ISP and
+  # nothing in this stack currently uses it — only isys is needed, and isys binds.
+  p "/dev/ipu7-psys0" "MISSING — the hardware ISP is unavailable, but both cameras still work through libcamera's software path"
+  # NOT broke(). A missing psys0 does not stop either camera working: both
+  # enumerate on libcamera's "simple" handler and capture live frames with
+  # psys0 absent, exactly as they do with it present. Calling this BROKEN made
+  # verify.sh report a working camera as a failure, which is worse than saying
+  # nothing -- it is what kept a reporter debugging a device node that nothing
+  # opens. Still reported, because psys IS how the hardware ISP would be reached
+  # if anything ever used it, but it is not a verdict.
+  UNTESTED+=("the hardware ISP path (/dev/ipu7-psys0 missing, intel_ipu7_psys never bound). Both cameras still work through libcamera's software path, so this alone does not mean the camera is broken")
 
   IPU7_P=$(mod_path intel_ipu7); PSYS_P=$(mod_path intel_ipu7_psys)
   IPU7_O=$(mod_origin "$IPU7_P"); PSYS_O=$(mod_origin "$PSYS_P")
