@@ -19,6 +19,43 @@ if [ ! -e /dev/ipu7-psys0 ]; then
   echo "      -> intel_ipu7_psys: $(modinfo -n intel_ipu7_psys 2>/dev/null | grep -qE '/updates/' && echo dkms || echo kernel)"
   echo "      -> split provenance means the defer check reads garbage. Fix:"
   echo "         sudo kernel/ipu7-psys-patches/fix-psys-defer.sh   (then rebuild all kernels + reboot)"
+
+  # Why did psys actually fail? Guessing from "MISSING" alone has cost real
+  # debugging time -- print the kernel's own reason.
+  r=$(dmesg 2>/dev/null | grep -iE 'psys' | grep -iE 'defer|fail|error|denied|signature|probe' | tail -3)
+  if [ -n "$r" ]; then
+    echo "      -> kernel says:"
+    echo "$r" | sed 's/^/           /'
+  else
+    echo "      -> kernel logged nothing about psys (run as root, or dmesg was cleared)"
+  fi
+
+  # Is the psys auxiliary device even present for a driver to bind to?
+  a=$(ls /sys/bus/auxiliary/devices/ 2>/dev/null | grep -i psys | head -1)
+  echo "      -> aux device: ${a:-ABSENT (intel_ipu7 never created it)}"
+fi
+
+# A DKMS rebuild does NOT regenerate the initramfs. A module that ships there
+# keeps loading the OLD build no matter how many times you rebuild it, and every
+# downstream symptom points somewhere else. This cost hours on 2026-07-26:
+# ipu-bridge was rebuilt correctly and the running kernel kept using the stale
+# copy, so a sensor driver kept reading a link frequency that had been fixed.
+stale=0
+for m in intel_ipu7 intel_ipu7_isys intel_ipu7_psys ipu_bridge intel_cvs hm1092; do
+  [ -e "/sys/module/$m/srcversion" ] || continue
+  l=$(cat "/sys/module/$m/srcversion" 2>/dev/null)
+  d=$(modinfo -F srcversion "$m" 2>/dev/null)
+  if [ -n "$l" ] && [ -n "$d" ] && [ "$l" != "$d" ]; then
+    [ $stale -eq 0 ] && echo "  STALE MODULES (loaded build != build on disk):"
+    stale=1
+    echo "      $m  loaded=${l%%${l#????????}}...  disk=${d%%${d#????????}}..."
+  fi
+done
+if [ $stale -eq 1 ]; then
+  echo "      -> the running kernel is NOT using what you just built."
+  echo "         Regenerate the initramfs and reboot:  sudo mkinitcpio -P"
+else
+  p "loaded modules match disk" "yes"
 fi
 
 # the fix: LINK_FREQ must be the DDR clock (180,480,000), not the bit rate
