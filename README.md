@@ -400,14 +400,33 @@ this is *not* split provenance and it says so, and it will not offer you
 `fix-psys-defer.sh` unless `dkms status` actually lists an `ipu7-drivers` tree
 for it to patch.
 
-Two failure modes worth naming, because both cost real debugging hours:
+Three failure modes worth naming, because all three cost real debugging hours:
 
-1. **Split provenance.** `intel_ipu7` from the kernel + `intel_ipu7_psys` from
+1. **The psys bus is never registered — kernel 7.1 and newer.** `ipu-psys.c`
+   puts its char device on a custom `intel-ipu7-psys` bus but registers itself
+   with `module_auxiliary_driver()`, which registers only the auxiliary driver;
+   `bus_register()` is called nowhere in the tree. Kernels up to about 7.0
+   tolerated a device on an unregistered bus. 7.1 rejects it, so probe runs
+   correctly all the way to its last step and fails:
+
+   ```
+   bus_add_device: cannot add device 'ipu7-psys0' to unregistered bus 'intel-ipu7-psys'
+   intel-ipu7-psys ipu7-psys0: psys device_register failed
+   probe with driver intel_ipu7_psys.psys failed with error -22
+   ```
+
+   Fix: `sudo ./dkms/ipu7-psys-patches/fix-psys-busreg.sh`, rebuild for every
+   kernel, reboot. `install.sh` applies it for you. This is the most common
+   cause of a missing `psys0` on a current kernel, and it is easy to misread as
+   a libcamera or PipeWire fault because `cam -l` and `cam -c` keep working —
+   only applications go blind, because PipeWire's libcamera monitor needs the
+   device node.
+2. **Split provenance.** `intel_ipu7` from the kernel + `intel_ipu7_psys` from
    DKMS means the two disagree about `struct ipu7_device`'s layout, so the
    readiness check reads the wrong offset and psys defers forever. `isys` binds
    normally because it ships with the kernel, which makes the failure look
    selective and sends people hunting the wrong component.
-2. **Stale modules.** *A DKMS rebuild does not regenerate the initramfs.* If a
+3. **Stale modules.** *A DKMS rebuild does not regenerate the initramfs.* If a
    module ships in the initramfs, the kernel keeps loading the **old** build no
    matter how many times you rebuild — and every downstream symptom points
    somewhere else. Fix with `sudo mkinitcpio -P` (Arch/CachyOS),
@@ -431,6 +450,34 @@ Everything it prints is followed from the sensor's own link in the media graph.
 If it cannot follow that link it prints `UNDETECTED — not guessing` and exits
 non-zero, rather than handing you a number that is right on somebody else's
 laptop.
+
+---
+
+## Removing it again
+
+```bash
+sudo ./uninstall.sh          # dry run — prints the plan, changes nothing
+sudo ./uninstall.sh --go
+sudo reboot
+```
+
+It removes only what this pack installs: its five DKMS modules, its two udev
+rules, its three wireplumber drop-ins, and the psys source patches — restored
+from the oldest backup the pack itself made and rebuilt for every kernel, so
+psys goes back to upstream behaviour. It regenerates the initramfs at the end,
+without which the old modules keep loading from it and the uninstall appears to
+have done nothing.
+
+It leaves the `ipu7-drivers` **package** alone — that belongs to your distro or
+the AUR — along with any DKMS module it did not install and anything you
+configured yourself, Howdy and PAM included.
+
+`--keep-psys` removes the sensor modules but leaves `ipu7-drivers` patched.
+That matters if suspend is your concern: until psys binds it never registers a
+device, so it never takes part in system suspend. Once it does bind it joins
+the suspend path for the first time, and on at least one board that surfaced a
+resume failure which had been invisible until then. Restoring the psys source
+is the specific thing that undoes it.
 
 ---
 
