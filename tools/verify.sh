@@ -358,6 +358,50 @@ else
   untested "libcamera's 'cam' tool is not installed, so application-level enumeration was not checked"
 fi
 
+# PipeWire reaches libcamera through a SEPARATE SPA plugin, shipped in its own
+# package that nothing pulls in automatically (an *optional* dependency of
+# pipewire on Arch). Without it WirePlumber's libcamera monitor runs and creates
+# no devices, so `wpctl status` shows an empty Video section and every
+# application reports no camera -- while `cam --list` and `cam --capture` work
+# perfectly, because they use libcamera directly and never touch the plugin.
+#
+# That split is why this is worth its own check: the two most obvious tests
+# disagree, and the one that looks authoritative is the one that is wrong.
+_SPA=""
+for d in /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu; do
+  for c in "$d"/spa-0.2/libcamera/libspa-libcamera.so; do
+    [ -e "$c" ] && { _SPA="$c"; break 2; }
+  done
+done
+if [ -n "$_SPA" ]; then
+  p "PipeWire libcamera plugin" "present"
+else
+  p "PipeWire libcamera plugin" "MISSING — applications will see no camera"
+  broke "libspa-libcamera.so is not installed, so PipeWire cannot expose any libcamera device"
+  sub "-> this is the usual reason 'cam --list' finds cameras but 'wpctl status'"
+  sub "   shows an empty Video section. PipeWire talks to libcamera through a"
+  sub "   separate SPA plugin that is NOT installed by default and that nothing"
+  sub "   else depends on."
+  sub "   Arch / CachyOS:  sudo pacman -S pipewire-libcamera"
+  sub "   Fedora:          sudo dnf install pipewire-plugin-libcamera"
+  sub "   Debian/Ubuntu:   sudo apt install pipewire-libcamera"
+  sub "   then: systemctl --user restart pipewire wireplumber"
+  next "install the PipeWire libcamera plugin, then 'systemctl --user restart pipewire wireplumber'"
+fi
+
+# Only meaningful once the plugin is there -- reporting an empty Video section
+# when the plugin is missing would just restate the line above.
+if [ -n "$_SPA" ] && have wpctl; then
+  WPCAMS=$(timeout 20 wpctl status 2>/dev/null | sed -n '/Video/,/Sinks/p' | grep -cE '\[libcamera\]' || true)
+  if [ "${WPCAMS:-0}" -gt 0 ]; then
+    p "PipeWire video devices" "$WPCAMS"
+  elif [ "${CAMS:-0}" -gt 0 ]; then
+    p "PipeWire video devices" "0 — libcamera sees $CAMS, PipeWire exposes none"
+    broke "PipeWire exposes no camera although libcamera enumerates $CAMS — applications will find nothing"
+    next "restart the stack: 'systemctl --user restart pipewire wireplumber', then re-run this script"
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 sec "-- IR camera / face unlock --"
 IR_BROKEN=0

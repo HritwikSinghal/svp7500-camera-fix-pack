@@ -129,14 +129,26 @@ Stop here and do not install if any of these describe you:
 
 ```bash
 # Arch / CachyOS
-sudo pacman -S dkms linux-headers v4l-utils
+sudo pacman -S dkms linux-headers v4l-utils libcamera pipewire-libcamera
 
 # Fedora
-sudo dnf install dkms kernel-devel v4l-utils
+sudo dnf install dkms kernel-devel v4l-utils libcamera pipewire-plugin-libcamera
 
 # Debian / Ubuntu
-sudo apt install dkms "linux-headers-$(uname -r)" v4l-utils
+sudo apt install dkms "linux-headers-$(uname -r)" v4l-utils libcamera-tools pipewire-libcamera
 ```
+
+**`pipewire-libcamera` is not optional here, whatever your package manager
+calls it.** PipeWire reaches libcamera through a separate SPA plugin
+(`libspa-libcamera.so`) that ships in its own package, is an *optional*
+dependency of `pipewire`, and that nothing else pulls in. Without it
+WirePlumber's libcamera monitor runs and creates no devices, so `wpctl status`
+shows an empty Video section and every browser and video-call app reports no
+camera — while `cam --list` and `cam --capture` work perfectly, because they use
+libcamera directly and never touch the plugin.
+
+That split is worth remembering: the CLI test that looks authoritative is the
+one that cannot see this failure. `verify.sh` checks for the plugin explicitly.
 
 Optional but recommended on Btrfs: `sudo snapper create -d "pre-svp7500-fix"`.
 
