@@ -358,6 +358,38 @@ else
   untested "libcamera's 'cam' tool is not installed, so application-level enumeration was not checked"
 fi
 
+# Module load ORDER. The sensors are behind the SVP7500's USB-I2C tunnel, so
+# usbio -> i2c_usbio -> intel_cvs -> INT3472 must exist before intel_ipu7 looks
+# for them. A softdep enforces that. Without it intel_ipu7 probes first, starts
+# its bring-up while the bridge driver is still registering, and the bridge
+# drops off the bus seconds later -- then re-enumerates and fails again,
+# forever, taking the i2c adapters and both sensors with it every cycle.
+#
+# Check the CONFIG, not just dmesg: on a machine already in the failure loop
+# the log is too noisy to read the original order out of.
+_SD=$(grep -rhs '^[[:space:]]*softdep[[:space:]]\+intel_ipu7' /etc/modprobe.d/ /usr/lib/modprobe.d/ 2>/dev/null | head -1)
+if [ -n "$_SD" ]; then
+  p "module load order" "softdep present"
+  case "$_SD" in
+    *usbio*intel_cvs*|*intel_cvs*usbio*) : ;;
+    *) sub "note: the softdep does not name both usbio and intel_cvs:"
+       sub "  $_SD" ;;
+  esac
+else
+  p "module load order" "NO softdep — intel_ipu7 may load before the USB bridge"
+  broke "no 'softdep intel_ipu7' rule: the imaging unit can probe before the SVP7500 bridge stack exists"
+  sub "-> symptom: everything binds correctly at boot, then a few seconds later"
+  sub "   the bridge starts cycling and never recovers:"
+  sub "     usbio-bridge: Bulk out failed: -110"
+  sub "     usb 3-3: USB disconnect, device number N   (N climbing)"
+  sub "   Check your own boot order with:"
+  sub "     sudo dmesg | grep -E 'Found supported sensor|usbio-bridge|cvs_common_probe'"
+  sub "   'Found supported sensor' BEFORE 'usbio-bridge' is the wrong order."
+  sub "   Fix: sudo install -m 0644 $ROOT/modprobe.d/99-ipu7-usbio-order.conf /etc/modprobe.d/"
+  sub "        then regenerate the initramfs and reboot"
+  next "install modprobe.d/99-ipu7-usbio-order.conf, regenerate the initramfs, reboot"
+fi
+
 # USB autosuspend on the CVS bridge. The bridge does not survive being runtime
 # suspended: it stops answering bulk transfers (-110 ETIMEDOUT), the hub drops
 # it (-108 ESHUTDOWN), the i2c adapters go with it, both sensors unbind, and

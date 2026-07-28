@@ -367,7 +367,8 @@ fi
 
 # udev payload. Both rules are installed in every mode (see the udev section):
 # the illuminator rule is a kernel/udev concern even though only Howdy needs it.
-for f in "$HERE/udev/99-hm1092-ir-led.rules" "$HERE/udev/99-svp7500-no-autosuspend.rules"; do
+for f in "$HERE/udev/99-hm1092-ir-led.rules" "$HERE/udev/99-svp7500-no-autosuspend.rules" \
+         "$HERE/modprobe.d/99-ipu7-usbio-order.conf"; do
   [[ -f $f ]] || pf_bad "package is missing ${f#"$HERE"/} — this clone/tarball is incomplete, re-download it"
 done
 # Howdy-side payload, checked only when the Howdy phase will run.
@@ -1002,6 +1003,43 @@ install_rule(){
   fi
   return 0
 }
+# Module load ordering. The sensors sit behind the SVP7500's USB-I2C tunnel,
+# so usbio -> i2c_usbio -> intel_cvs -> INT3472 must all exist before
+# intel_ipu7 goes looking for them. Without this, intel_ipu7 probes first and
+# starts its bring-up while the bridge driver is still being registered; the
+# bridge then drops off the bus a few seconds later and re-enumerates forever,
+# taking the i2c adapters, both sensors and the media graph with it each cycle.
+MPD_SRC=""
+for c in "$HERE/modprobe.d/99-ipu7-usbio-order.conf"; do
+  [[ -f $c ]] && { MPD_SRC="$c"; break; }
+done
+if [[ -z $MPD_SRC ]]; then
+  UDEV_FAIL=$((UDEV_FAIL+1))
+  bad "modprobe.d/99-ipu7-usbio-order.conf is missing from this package"
+  action "re-download the package: the module ordering rule is missing"
+else
+  run mkdir -p /etc/modprobe.d
+  if ! run install -m 0644 "$MPD_SRC" /etc/modprobe.d/; then
+    UDEV_FAIL=$((UDEV_FAIL+1))
+    bad "could not write /etc/modprobe.d/99-ipu7-usbio-order.conf"
+    action "copy modprobe.d/99-ipu7-usbio-order.conf to /etc/modprobe.d/ by hand"
+  elif [[ $DRY_RUN -eq 0 ]]; then
+    if [[ -f /etc/modprobe.d/99-ipu7-usbio-order.conf ]]; then
+      ok "installed /etc/modprobe.d/99-ipu7-usbio-order.conf (bridge loads before IPU7)"
+      # An existing file with the same softdep under a different name would
+      # double-apply harmlessly, but a CONFLICTING one would not -- say so.
+      for other in /etc/modprobe.d/*.conf; do
+        [[ $other == /etc/modprobe.d/99-ipu7-usbio-order.conf ]] && continue
+        grep -q 'softdep intel_ipu7' "$other" 2>/dev/null && \
+          warn "another softdep for intel_ipu7 exists in $other — check they agree"
+      done
+    else
+      UDEV_FAIL=$((UDEV_FAIL+1))
+      bad "install reported success but /etc/modprobe.d/99-ipu7-usbio-order.conf is not there"
+    fi
+  fi
+fi
+
 run mkdir -p /etc/udev/rules.d
 install_rule 99-svp7500-no-autosuspend.rules
 install_rule 99-hm1092-ir-led.rules

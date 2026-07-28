@@ -465,6 +465,39 @@ laptop.
 
 ---
 
+## Module load order
+
+The sensors on these boards are not on a native I2C controller. They sit behind
+the Synaptics SVP7500, which exposes an I2C tunnel over a USB bulk interface.
+That whole chain — `usbio` → `i2c_usbio` → `intel_cvs` → `INT3472` — has to
+exist **before** `intel_ipu7` goes looking for sensors.
+
+`install.sh` writes `/etc/modprobe.d/99-ipu7-usbio-order.conf` for this. Without
+it, everything binds correctly at boot and then falls apart a few seconds later:
+
+```
+intel-ipu7 0000:00:05.0: Found supported sensor HIMX1092:00
+intel-ipu7 0000:00:05.0: Found supported sensor OVTI08F4:00
+usbcore: registered new interface driver usbio-bridge     <- too late
+Intel CVS driver i2c-INTC10E1:00: cvs_common_probe        <- too late
+        ... ~9s later ...
+usbio-bridge 3-3:1.0: Bulk out failed: -110
+usb 3-3: USB disconnect, device number 2
+```
+
+after which the bridge re-enumerates and fails again, indefinitely, taking the
+i2c adapters, both sensors and the media graph with it every cycle. Check your
+own order with:
+
+```bash
+sudo dmesg | grep -E 'Found supported sensor|usbio-bridge|cvs_common_probe'
+```
+
+`Found supported sensor` appearing **before** `usbio-bridge` is the wrong order.
+`verify.sh` checks for the softdep directly.
+
+---
+
 ## The second half: making browsers work
 
 This package fixes the **kernel** side — the sensors bind, `/dev/ipu7-psys0`
