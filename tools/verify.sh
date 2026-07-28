@@ -419,8 +419,26 @@ fi
 
 # Only meaningful once the plugin is there -- reporting an empty Video section
 # when the plugin is missing would just restate the line above.
+# wpctl talks to the PipeWire instance in the CALLER's session. This script is
+# meant to be run with sudo, and root's session has no camera devices in it --
+# so asking as root reports zero on a machine whose user session has two, and
+# calls a working install BROKEN. Ask as the desktop user.
+wpctl_status(){
+  _u=${SUDO_USER:-}
+  [ -z "$_u" ] && _u=$(loginctl list-sessions --no-legend 2>/dev/null | awk '$3 != "root" { print $3; exit }')
+  [ -z "$_u" ] && _u=$(logname 2>/dev/null || true)
+  if [ $IS_ROOT -eq 1 ] && [ -n "$_u" ] && [ "$_u" != root ]; then
+    _uid=$(id -u "$_u" 2>/dev/null || true)
+    if [ -n "$_uid" ]; then
+      runuser -u "$_u" -- env XDG_RUNTIME_DIR="/run/user/$_uid" timeout 20 wpctl status 2>/dev/null
+      return
+    fi
+  fi
+  timeout 20 wpctl status 2>/dev/null
+}
+
 if [ -n "$_SPA" ] && have wpctl; then
-  WPCAMS=$(timeout 20 wpctl status 2>/dev/null | sed -n '/Video/,/Sinks/p' | grep -cE '\[libcamera\]' || true)
+  WPCAMS=$(wpctl_status | sed -n '/Video/,/Sinks/p' | grep -cE '\[libcamera\]' || true)
   if [ "${WPCAMS:-0}" -gt 0 ]; then
     p "PipeWire video devices" "$WPCAMS"
   elif [ "${CAMS:-0}" -gt 0 ]; then
