@@ -358,6 +358,46 @@ else
   untested "libcamera's 'cam' tool is not installed, so application-level enumeration was not checked"
 fi
 
+# USB autosuspend on the CVS bridge. The bridge does not survive being runtime
+# suspended: it stops answering bulk transfers (-110 ETIMEDOUT), the hub drops
+# it (-108 ESHUTDOWN), the i2c adapters go with it, both sensors unbind, and
+# the media graph empties -- then it re-enumerates and does it again, every few
+# seconds, forever.
+#
+# The giveaway is that it only starts when a DESKTOP session does: on a bare
+# console nothing runs power management, the bridge is stable, and `cam -l`
+# lists both cameras. One reporter chased this as a firmware crash-loop (and so
+# did I) before their console boot showed the stack was fine.
+#
+# This package ships a udev rule to pin it, but a power daemon -- TLP in
+# particular, which sets USB_AUTOSUSPEND=1 by default -- can reapply autosuspend
+# after udev has run, so check the live value rather than the rule file.
+for _ud in /sys/bus/usb/devices/*; do
+  [ "$(cat "$_ud/idVendor" 2>/dev/null)" = "06cb" ] || continue
+  _ctl=$(cat "$_ud/power/control" 2>/dev/null)
+  _dly=$(cat "$_ud/power/autosuspend_delay_ms" 2>/dev/null)
+  if [ "$_ctl" = "on" ]; then
+    p "CVS bridge autosuspend" "disabled (control=on) — correct"
+  else
+    p "CVS bridge autosuspend" "ENABLED (control=${_ctl:-?}) — the bridge will drop off the bus"
+    broke "USB autosuspend is enabled on the CVS bridge; it does not survive being suspended"
+    sub "-> symptom: the camera works until a desktop session starts, then the"
+    sub "   bridge cycles every few seconds (Bulk out failed -110, USB"
+    sub "   disconnect, re-enumerate) and no application can hold it open."
+    sub "   Fix now, no reboot:"
+    sub "     echo on | sudo tee $_ud/power/control"
+    sub "     echo -1 | sudo tee $_ud/power/autosuspend_delay_ms"
+    sub "   Durably: install udev/99-svp7500-no-autosuspend.rules (install.sh"
+    sub "   does). If it keeps reverting, a power daemon is overriding udev --"
+    sub "   TLP sets USB_AUTOSUSPEND=1 by default; add USB_DENYLIST=\"06cb:0701\""
+    sub "   to /etc/tlp.conf."
+    next "disable USB autosuspend on the CVS bridge — it drops off the bus otherwise"
+  fi
+  [ -n "$_dly" ] && [ "$_dly" != "-1" ] && [ "$_ctl" = "on" ] && \
+    sub "note: autosuspend_delay_ms is $_dly, expected -1"
+  break
+done
+
 # Which libcamera pipeline handler is PipeWire actually using? This decides
 # whether browsers work, and nothing else in this script can see it.
 #
