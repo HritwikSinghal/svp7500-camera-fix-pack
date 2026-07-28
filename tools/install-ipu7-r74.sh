@@ -142,6 +142,20 @@ else
       warn "defer fix did not apply — check /dev/ipu7-psys0 after rebooting"
     fi
   fi
+  # The bus fix. Without it, kernel 7.1+ rejects device_register() onto the
+  # unregistered intel-ipu7-psys bus with -EINVAL and psys0 never appears --
+  # this recovery path was handing people a still-dead camera.
+  if [[ -f $PATCHDIR/fix-psys-busreg.sh ]]; then
+    if [[ $DRY -eq 1 ]]; then
+      printf '    would run: fix-psys-busreg.sh %s\n' "$SRC"
+    elif bash "$PATCHDIR/fix-psys-busreg.sh" "$SRC" >/dev/null 2>&1; then
+      ok "psys bus registered before the aux driver"
+    else
+      warn "bus fix did not apply — on kernel 7.1+ psys cannot bind without it"
+    fi
+  else
+    warn "fix-psys-busreg.sh is missing from this package — on kernel 7.1+ psys0 will not appear"
+  fi
 fi
 
 # --- remove the broken revision, build r74 -----------------------------------
