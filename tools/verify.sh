@@ -207,7 +207,7 @@ else
     sub "     psys device_register failed ... failed with error -22"
     sub "   Fix: sudo $ROOT/dkms/ipu7-psys-patches/fix-psys-busreg.sh"
     sub "        then rebuild for every kernel and reboot"
-    next "apply fix-psys-busreg.sh, rebuild ipu7-drivers for every kernel, reboot"
+    next "apply fix-psys-busreg.sh AND fix-psys-debugfs.sh, rebuild for every kernel, reboot"
   elif [ "$IPU7_O" = kernel ] && [ "$PSYS_O" = dkms ]; then
     sub "-> SPLIT PROVENANCE: intel_ipu7 comes from your kernel package and"
     sub "   intel_ipu7_psys from DKMS. The two disagree about struct"
@@ -356,6 +356,34 @@ if have cam; then
 else
   p "libcamera (cam --list)" "not tested ('cam' not installed — package: libcamera-tools)"
   untested "libcamera's 'cam' tool is not installed, so application-level enumeration was not checked"
+fi
+
+# THE DANGEROUS COMBINATION. The bus fix lets probe run past device_register()
+# and straight into ipu7_psys_init_debugfs(), which dereferences
+# psys->adev->isp->ipu7_dir -- a field read at the wrong offset when psys is
+# DKMS and intel_ipu7 is the kernel's. That is not a failed probe, it is a wild
+# pointer in module_init: the udev worker dies and the rest soft-lock, so the
+# machine does not boot. Warn loudly whenever one is applied without the other.
+_dv=$(dkms status 2>/dev/null | sed -n 's|^ipu7-drivers[/,] *\([^,]*\),.*|\1|p' | sort -u | head -1)
+_dsrc=/usr/src/ipu7-drivers-$_dv/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
+if [ -n "$_dv" ] && [ -f "$_dsrc" ]; then
+  if grep -q 'bus_register(&ipu7_psys_bus)' "$_dsrc" &&
+     ! grep -q 'debugfs_create_dir("ipu7-psys", NULL)' "$_dsrc"; then
+    p "psys debugfs deref" "UNPATCHED while the bus fix IS applied"
+    broke "psys will dereference a wild pointer in module_init and can make this machine UNBOOTABLE"
+    sub "-> the bus fix lets probe reach ipu7_psys_init_debugfs(), which reads"
+    sub "   psys->adev->isp->ipu7_dir at the wrong struct offset and passes the"
+    sub "   result to debugfs_create_dir(). Expect, at boot:"
+    sub "     Oops: general protection fault ... debugfs_create_dir"
+    sub "     watchdog: BUG: soft lockup ... [modprobe]"
+    sub "   Fix BEFORE rebooting:"
+    sub "     sudo $ROOT/dkms/ipu7-psys-patches/fix-psys-debugfs.sh"
+    sub "     then rebuild for every kernel"
+    sub "   Already stuck? Boot once with  modprobe.blacklist=intel_ipu7_psys"
+    next "apply fix-psys-debugfs.sh and rebuild BEFORE rebooting — psys can oops the kernel as it stands"
+  elif grep -q 'debugfs_create_dir("ipu7-psys", NULL)' "$_dsrc"; then
+    p "psys debugfs deref" "patched (no wild isp->ipu7_dir deref)"
+  fi
 fi
 
 # PipeWire reaches libcamera through a SEPARATE SPA plugin, shipped in its own

@@ -156,6 +156,20 @@ else
   else
     warn "fix-psys-busreg.sh is missing from this package — on kernel 7.1+ psys0 will not appear"
   fi
+  # Must accompany the bus fix -- see fix-psys-debugfs.sh. Reachable only once
+  # probe gets past device_register(), and it oopses the kernel rather than
+  # failing cleanly.
+  if [[ -f $PATCHDIR/fix-psys-debugfs.sh ]]; then
+    if [[ $DRY -eq 1 ]]; then
+      printf '    would run: fix-psys-debugfs.sh %s\n' "$SRC"
+    elif bash "$PATCHDIR/fix-psys-debugfs.sh" "$SRC" >/dev/null 2>&1; then
+      ok "psys debugfs parent rooted safely"
+    else
+      warn "debugfs fix did not apply — psys may OOPS THE KERNEL at boot; do not reboot until this is resolved"
+    fi
+  else
+    warn "fix-psys-debugfs.sh is missing — with the bus fix applied psys can oops the kernel at boot"
+  fi
 fi
 
 # --- remove the broken revision, build r74 -----------------------------------

@@ -1043,6 +1043,11 @@ for c in "$HERE/dkms/ipu7-psys-patches/fix-psys-busreg.sh" \
          "$HERE/kernel/ipu7-psys-patches/fix-psys-busreg.sh"; do
   [[ -f $c ]] && { BUSREGFIX="$c"; break; }
 done
+DEBUGFSFIX=""
+for c in "$HERE/dkms/ipu7-psys-patches/fix-psys-debugfs.sh" \
+         "$HERE/kernel/ipu7-psys-patches/fix-psys-debugfs.sh"; do
+  [[ -f $c ]] && { DEBUGFSFIX="$c"; break; }
+done
 
 # Pick the tree DKMS actually HAS INSTALLED. Selecting with `ls | tail -1`
 # grabs a stale leftover tree and silently patches the wrong source. Parse both
@@ -1275,6 +1280,56 @@ if [[ $PSYS_TREE_OK -eq 1 ]]; then
       action "restore $PSYSC from $SNAP3 by hand"
     fi
     action "run '$BUSREGFIX $IPUSRC' by hand and fix what it reports, then rebuild ipu7-drivers — on kernel 7.1+ psys cannot bind without this"
+  fi
+
+  # The debugfs fix. MUST accompany the bus fix: it is only reachable once
+  # probe gets past device_register(), and it does not merely fail -- it
+  # dereferences a wild pointer in module_init, taking the udev worker with it
+  # and soft-locking the remaining ones. That is an unbootable system, not a
+  # dead camera. Never ship the bus fix without this one.
+  if [[ -z $DEBUGFSFIX ]]; then
+    PATCH_FAIL=$((PATCH_FAIL+1))
+    bad "fix-psys-debugfs.sh is not in this package — REFUSING to leave the bus fix applied without it; psys would oops the kernel at boot"
+    action "re-download the package: fix-psys-debugfs.sh is missing and the bus fix is unsafe alone"
+  elif [[ ! -f $PSYSC ]]; then
+    PATCH_FAIL=$((PATCH_FAIL+1))
+    bad "$PSYSC not found — run ${DEBUGFSFIX#"$HERE"/} by hand against your source"
+    action "locate ipu-psys.c in $IPUSRC and run $DEBUGFSFIX against it"
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    if grep -q 'debugfs_create_dir("ipu7-psys", NULL)' "$PSYSC"; then
+      plan "psys debugfs parent already rooted safely in $PSYSC — would be a no-op"
+      PATCH_OK=$((PATCH_OK+1))
+    elif grep -q 'debugfs_create_dir("psys", psys->adev->isp->ipu7_dir)' "$PSYSC"; then
+      plan "would run: $DEBUGFSFIX $IPUSRC   (wild isp->ipu7_dir deref found in $PSYSC)"
+      PATCH_OK=$((PATCH_OK+1))
+    else
+      bad "the debugfs call in $PSYSC is neither shape — fix-psys-debugfs.sh would refuse"
+      PATCH_FAIL=$((PATCH_FAIL+1))
+      action "inspect $PSYSC by hand: the debugfs_create_dir call this fix targets is not where it was"
+    fi
+  elif ! SNAP4=$(psys_snapshot debugfs); then
+    PATCH_FAIL=$((PATCH_FAIL+1))
+    bad "cannot write a backup of $PSYSC — refusing to run the debugfs fix against a vendor tree with no way back"
+    action "check permissions/space on $IPUSRC, then re-run"
+  elif GERR=$(bash "$DEBUGFSFIX" "$IPUSRC" 2>&1); then
+    PATCH_OK=$((PATCH_OK+1))
+    if cmp -s "$SNAP4" "$PSYSC"; then rm -f "$SNAP4"; else PSYS_SNAPS+=("$SNAP4"); fi
+    ok "psys debugfs parent rooted safely (no wild isp->ipu7_dir deref)"
+  else
+    PATCH_FAIL=$((PATCH_FAIL+1))
+    bad "psys debugfs fix did not apply to $PSYSC — it said:"
+    printf '%s\n' "$GERR" | sed 's/^/          /'
+    if cmp -s "$SNAP4" "$PSYSC"; then
+      rm -f "$SNAP4"
+      warn "$PSYSC was not modified — the tree is exactly as it was before this step"
+    elif cp -a "$SNAP4" "$PSYSC"; then
+      rm -f "$SNAP4"
+      bad "$PSYSC had already been modified when it failed, and was RESTORED to the state it was in before this step"
+    else
+      PSYS_SNAPS+=("$SNAP4")
+      bad "$PSYSC was modified and could NOT be restored from $SNAP4 — restore it by hand before rebuilding"
+    fi
+    action "run '$DEBUGFSFIX $IPUSRC' by hand — WITHOUT this, psys oopses the kernel during boot on any CONFIG_DEBUG_FS kernel"
   fi
 
   # 3) rebuild ipu7-drivers for every kernel, and verify the psys .ko landed.
