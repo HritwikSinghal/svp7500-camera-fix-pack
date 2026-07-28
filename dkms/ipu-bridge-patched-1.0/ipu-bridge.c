@@ -120,6 +120,26 @@ static const struct dmi_system_id upside_down_sensor_dmi_ids[] = {
 		},
 		.driver_data = "OVTI02C1",
 	},
+	/*
+	 * Panther Lake XPS boards with the OV08X40 behind the SVP7500 bridge.
+	 * Both report degree=0 in the SSDB and have no _PLD, but the sensor is
+	 * physically mounted inverted -- confirmed on both machines by the
+	 * preview being upside down with a stock libcamera.
+	 */
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "XPS 16 DA16260"),
+		},
+		.driver_data = "OVTI08F4",
+	},
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "XPS 14 DA14260"),
+		},
+		.driver_data = "OVTI08F4",
+	},
 	{} /* Terminating entry */
 };
 
