@@ -187,6 +187,27 @@ else
     sub "   nothing to bind. It was never built for this kernel, or was built"
     sub "   for a different one."
     next "install the headers for $(uname -r) and re-run 'sudo $ROOT/install.sh'"
+  elif _bv=$(dkms status 2>/dev/null | sed -n 's|^ipu7-drivers/\([^,]*\),.*|\1|p' | sort -u | head -1) &&
+       [ -n "$_bv" ] &&
+       [ -f "/usr/src/ipu7-drivers-$_bv/drivers/media/pci/intel/ipu7/psys/ipu-psys.c" ] &&
+       ! grep -q 'bus_register(&ipu7_psys_bus)' \
+         "/usr/src/ipu7-drivers-$_bv/drivers/media/pci/intel/ipu7/psys/ipu-psys.c"; then
+    # Ranked ABOVE split provenance on purpose. This one is deterministic on
+    # kernel 7.1+ whatever the provenance is, and it is checkable from the
+    # source without root, so when it applies it is the answer rather than a
+    # theory. Getting the order wrong sends people to rebuild DKMS over and
+    # over against a bug no rebuild can fix.
+    sub "-> the psys BUS IS NEVER REGISTERED. ipu-psys.c puts its char device on"
+    sub "   a custom 'intel-ipu7-psys' bus, but registers itself with"
+    sub "   module_auxiliary_driver(), which registers only the aux driver --"
+    sub "   bus_register() is called nowhere in the tree. Kernels up to ~7.0"
+    sub "   tolerated a device on an unregistered bus; 7.1 rejects it, so probe"
+    sub "   reaches its last step and fails with -EINVAL. Confirm in dmesg:"
+    sub "     bus_add_device: cannot add device 'ipu7-psys0' to unregistered bus"
+    sub "     psys device_register failed ... failed with error -22"
+    sub "   Fix: sudo $ROOT/dkms/ipu7-psys-patches/fix-psys-busreg.sh"
+    sub "        then rebuild for every kernel and reboot"
+    next "apply fix-psys-busreg.sh, rebuild ipu7-drivers for every kernel, reboot"
   elif [ "$IPU7_O" = kernel ] && [ "$PSYS_O" = dkms ]; then
     sub "-> SPLIT PROVENANCE: intel_ipu7 comes from your kernel package and"
     sub "   intel_ipu7_psys from DKMS. The two disagree about struct"
@@ -211,7 +232,7 @@ else
         sub "   the ipu7-drivers source for $_iv is not at $_isrc,"
         sub "   so the patch state cannot be determined."
         next "report this with 'dkms status' and 'ls /usr/src | grep ipu7'"
-      elif ! grep -q 'DKMS struct layout mismatch' "$_isrc"; then
+      elif ! grep -qE 'psys_ready_deadline|DKMS struct layout mismatch' "$_isrc"; then
         sub "   the defer fix is NOT in your source. That is the thing to fix:"
         sub "   Fix: sudo $ROOT/dkms/ipu7-psys-patches/fix-psys-defer.sh"
         sub "        then rebuild for every kernel and reboot"

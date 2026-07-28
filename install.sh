@@ -1038,6 +1038,11 @@ for c in "$HERE/dkms/ipu7-psys-patches/fix-psys-defer.sh" \
          "$HERE/kernel/ipu7-psys-patches/fix-psys-defer.sh"; do
   [[ -f $c ]] && { DEFERFIX="$c"; break; }
 done
+BUSREGFIX=""
+for c in "$HERE/dkms/ipu7-psys-patches/fix-psys-busreg.sh" \
+         "$HERE/kernel/ipu7-psys-patches/fix-psys-busreg.sh"; do
+  [[ -f $c ]] && { BUSREGFIX="$c"; break; }
+done
 
 # Pick the tree DKMS actually HAS INSTALLED. Selecting with `ls | tail -1`
 # grabs a stale leftover tree and silently patches the wrong source. Parse both
@@ -1168,7 +1173,10 @@ if [[ $PSYS_TREE_OK -eq 1 ]]; then
     action "locate ipu-psys.c in $IPUSRC and run $DEFERFIX against it"
   elif [[ $DRY_RUN -eq 1 ]]; then
     # Read-only inspection of exactly what the fix looks for.
-    if grep -q 'DKMS struct layout mismatch' "$PSYSC"; then
+    # Accept either marker: 'psys_ready_deadline' is the current bounded wait,
+    # 'DKMS struct layout mismatch' the earlier unconditional skip. Checking
+    # only the old one reports a correctly-patched tree as unpatched.
+    if grep -qE 'psys_ready_deadline|DKMS struct layout mismatch' "$PSYSC"; then
       plan "defer fix already applied in $PSYSC — would be a no-op"
       PATCH_OK=$((PATCH_OK+1))
     elif grep -qE 'if \(!.*ipu7_bus_ready_to_probe\)' "$PSYSC"; then
@@ -1205,6 +1213,68 @@ if [[ $PSYS_TREE_OK -eq 1 ]]; then
       action "restore $PSYSC from $SNAP2 by hand"
     fi
     action "run '$DEFERFIX $IPUSRC' by hand and fix what it reports, then rebuild ipu7-drivers — until the defer check is neutralised /dev/ipu7-psys0 may never appear"
+  fi
+
+  # The bus fix. A SEPARATE failure from the defer one, with its own symptom,
+  # so it gets its own block and must not be gated on the defer result.
+  #
+  # psys puts its char device on a custom `intel-ipu7-psys` bus but registers
+  # itself with module_auxiliary_driver(), which registers the aux driver only
+  # -- bus_register() is never called anywhere in the tree. Kernels up to ~7.0
+  # tolerated a device on an unregistered bus; 7.1 hardened bus_add_device() to
+  # reject it, so probe reaches its last step and dies with -EINVAL:
+  #
+  #     bus_add_device: cannot add device 'ipu7-psys0' to unregistered bus
+  #     psys device_register failed ... failed with error -22
+  #
+  # Same end result as the defer bug (no /dev/ipu7-psys0, no camera in any
+  # application, `cam -l` still fine) via a completely different route, which
+  # is exactly why it went unnoticed here for so long: this fix lived only on
+  # the author's machine while the package shipped the other four.
+  if [[ -z $BUSREGFIX ]]; then
+    PATCH_FAIL=$((PATCH_FAIL+1))
+    bad "fix-psys-busreg.sh is not in this package — packaging bug; on kernel 7.1+ psys will fail with device_register -22 and /dev/ipu7-psys0 will never appear"
+    action "re-download the package: fix-psys-busreg.sh is missing"
+  elif [[ ! -f $PSYSC ]]; then
+    PATCH_FAIL=$((PATCH_FAIL+1))
+    bad "$PSYSC not found — run ${BUSREGFIX#"$HERE"/} by hand against your source"
+    action "locate ipu-psys.c in $IPUSRC and run $BUSREGFIX against it"
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    if grep -q 'bus_register(&ipu7_psys_bus)' "$PSYSC"; then
+      plan "psys bus registration already present in $PSYSC — would be a no-op"
+      PATCH_OK=$((PATCH_OK+1))
+    elif grep -q 'module_auxiliary_driver(ipu7_psys_driver);' "$PSYSC"; then
+      plan "would run: $BUSREGFIX $IPUSRC   (unregistered psys bus found in $PSYSC)"
+      PATCH_OK=$((PATCH_OK+1))
+    else
+      bad "neither bus_register nor module_auxiliary_driver is in $PSYSC — fix-psys-busreg.sh would refuse"
+      PATCH_FAIL=$((PATCH_FAIL+1))
+      action "inspect $PSYSC by hand: the module registration this fix targets is not where it was"
+    fi
+  elif ! SNAP3=$(psys_snapshot busreg); then
+    PATCH_FAIL=$((PATCH_FAIL+1))
+    bad "cannot write a backup of $PSYSC — refusing to run the bus fix against a vendor tree with no way back"
+    action "check permissions/space on $IPUSRC, then re-run"
+  elif BERR=$(bash "$BUSREGFIX" "$IPUSRC" 2>&1); then
+    PATCH_OK=$((PATCH_OK+1))
+    if cmp -s "$SNAP3" "$PSYSC"; then rm -f "$SNAP3"; else PSYS_SNAPS+=("$SNAP3"); fi
+    ok "psys bus registered before the aux driver"
+  else
+    PATCH_FAIL=$((PATCH_FAIL+1))
+    bad "psys bus fix did not apply to $PSYSC — it said:"
+    printf '%s\n' "$BERR" | sed 's/^/          /'
+    if cmp -s "$SNAP3" "$PSYSC"; then
+      rm -f "$SNAP3"
+      warn "$PSYSC was not modified — the tree is exactly as it was before this step"
+    elif cp -a "$SNAP3" "$PSYSC"; then
+      rm -f "$SNAP3"
+      bad "$PSYSC had already been modified when it failed, and was RESTORED to the state it was in before this step"
+    else
+      PSYS_SNAPS+=("$SNAP3")
+      bad "$PSYSC was modified and could NOT be restored from $SNAP3 — restore it by hand before rebuilding"
+      action "restore $PSYSC from $SNAP3 by hand"
+    fi
+    action "run '$BUSREGFIX $IPUSRC' by hand and fix what it reports, then rebuild ipu7-drivers — on kernel 7.1+ psys cannot bind without this"
   fi
 
   # 3) rebuild ipu7-drivers for every kernel, and verify the psys .ko landed.
