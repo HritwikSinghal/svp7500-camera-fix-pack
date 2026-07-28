@@ -465,6 +465,58 @@ laptop.
 
 ---
 
+## The second half: making browsers work
+
+This package fixes the **kernel** side — the sensors bind, `/dev/ipu7-psys0`
+appears, and the cameras enumerate. That is necessary and it is not sufficient.
+
+Stock libcamera falls back to its `simple` pipeline handler plus `SoftwareIsp`.
+That works at the sensor's native resolution and **aborts at every other size**:
+
+```
+cam --stream width=640,height=480    -> Assertion '__n < this->size()' failed
+cam --stream width=1280,height=720   -> Assertion '__n < this->size()' failed
+cam --stream width=1920,height=1080  -> Assertion '__n < this->size()' failed
+cam  (native)                        -> works
+```
+
+Below roughly half the sensor width libcamera selects the binned sensor mode,
+and the statistics pass indexes past the end of a 64-bin array. Inside
+WirePlumber that abort kills the process, and the application reports *"camera
+in use by another application"*.
+
+**Browsers ask for exactly those sizes.** So `cam --list` and `cam --capture`
+look perfect while every real application fails — which is the single most
+misleading state in this whole stack, because the test that looks authoritative
+is the one that cannot see the problem. `LIBCAMERA_SOFTISP_MODE=cpu` does not
+help; the bug is in the shared statistics path, reached from both debayer
+backends.
+
+The fix is a libcamera pipeline handler that drives the IPU7's **hardware ISP**
+through `/dev/ipu7-psys0`:
+
+| resolution | stock `simple` | `ipu7` handler |
+|---|---|---|
+| 1280x720  | crash | 28.57 fps |
+| 1920x1080 | crash | 28.57 fps |
+| native    | works | works |
+
+It also costs far less CPU, since the ISP does the debayer instead of the host.
+
+**https://github.com/jibsta210/ipu7-camera-linux** — see `libcamera-pipeline/BUILD.md`.
+
+`verify.sh` reports which handler PipeWire is using and says so if you are on
+the software one. Note it reads WirePlumber's journal, not `cam`: the CLI loads
+your *system* libcamera and will say `simple` even when PipeWire is correctly
+using the hardware handler.
+
+⚠ The handler's ISP parameters were captured from the Intel Camera HAL for
+**OV08X40**. On a board with a different RGB sensor (OV05C10, for instance) it
+will need its own parameters and may not work unmodified. The kernel-side fixes
+in this package are sensor-independent; this part is not.
+
+---
+
 ## Removing it again
 
 ```bash

@@ -358,6 +358,51 @@ else
   untested "libcamera's 'cam' tool is not installed, so application-level enumeration was not checked"
 fi
 
+# Which libcamera pipeline handler is PipeWire actually using? This decides
+# whether browsers work, and nothing else in this script can see it.
+#
+#   simple -> libcamera's SoftwareIsp. Fine at the sensor's native resolution,
+#             but ANY smaller size (640x480, 720p, 1080p -- what every browser
+#             asks for) selects the binned sensor mode, and the statistics pass
+#             indexes past the end of a 64-bin array and calls abort(). Inside
+#             WirePlumber that kills the process and the app reports "camera in
+#             use by another application".
+#   ipu7   -> the hardware ISP via /dev/ipu7-psys0. Every resolution works.
+#
+# Read it from WirePlumber's journal rather than `cam`: the CLI loads the
+# SYSTEM libcamera, so it reports `simple` even on a machine where PipeWire is
+# correctly using the hardware handler. Checking the wrong one is how this got
+# missed for months.
+_PH=$(journalctl --user -u wireplumber -b --no-pager -o cat 2>/dev/null \
+        | grep -oE 'for pipeline handler [a-z0-9_]+' | tail -1 | awk '{print $NF}')
+if [ -z "$_PH" ] && [ -n "${SUDO_USER:-}" ]; then
+  _PH=$(runuser -u "$SUDO_USER" -- journalctl --user -u wireplumber -b --no-pager -o cat 2>/dev/null \
+        | grep -oE 'for pipeline handler [a-z0-9_]+' | tail -1 | awk '{print $NF}')
+fi
+case "${_PH:-}" in
+  ipu7)
+    p "libcamera pipeline" "ipu7 — hardware ISP" ;;
+  simple)
+    p "libcamera pipeline" "simple — SOFTWARE ISP, browsers will crash"
+    broke "PipeWire is using libcamera's software ISP, which aborts at every resolution a browser asks for"
+    sub "-> the camera works from the CLI at its native resolution and fails in"
+    sub "   every application. 640x480, 720p and 1080p select the binned sensor"
+    sub "   mode and libcamera aborts inside WirePlumber:"
+    sub "     Assertion '__n < this->size()' failed."
+    sub "     SwStatsCpu::processBayerFrame2 <- Debayer{Cpu,EGL}::process"
+    sub "   LIBCAMERA_SOFTISP_MODE=cpu does NOT help — it is the shared stats path."
+    sub "   Fix: build the IPU7 pipeline handler (hardware ISP via psys0):"
+    sub "     https://github.com/jibsta210/ipu7-camera-linux -> libcamera-pipeline/BUILD.md"
+    sub "   NOTE: its ISP parameters were captured for OV08X40. Another RGB"
+    sub "   sensor will need its own and may not work unmodified."
+    next "build the IPU7 libcamera pipeline handler — without it browsers cannot open this camera" ;;
+  "")
+    p "libcamera pipeline" "not tested (no wireplumber journal for this boot)"
+    untested "could not determine which libcamera pipeline handler PipeWire is using" ;;
+  *)
+    p "libcamera pipeline" "$_PH" ;;
+esac
+
 # THE DANGEROUS COMBINATION. The bus fix lets probe run past device_register()
 # and straight into ipu7_psys_init_debugfs(), which dereferences
 # psys->adev->isp->ipu7_dir -- a field read at the wrong offset when psys is
