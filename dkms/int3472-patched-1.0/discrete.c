@@ -164,6 +164,23 @@ static const struct int3472_gpio_map int3472_gpio_map[] = {
 		.con_id = "dvdd",
 		.enable_time_us = 45 * USEC_PER_MSEC,
 	},
+	{	/*
+		 * ov05c10 needs 50 ms rather than the 25 ms default. Intel
+		 * raised the global default for this in ipu6-drivers PR #427
+		 * (merged 2026-03-18, shipped in Ubuntu linux-oem-6.17 via
+		 * Launchpad bug 2147409) with the comment "Himax needs 50 ms".
+		 *
+		 * Done as a per-sensor quirk instead, matching the OVTI08F4
+		 * entry above: raising the global default would change the
+		 * power-up timing of every board this module touches,
+		 * including ones whose cameras work today.
+		 */
+		.hid = "OVTI05C1",
+		.type_from = INT3472_GPIO_TYPE_HANDSHAKE,
+		.type_to = INT3472_GPIO_TYPE_HANDSHAKE,
+		.con_id = "dvdd",
+		.enable_time_us = 50 * USEC_PER_MSEC,
+	},
 };
 
 static void int3472_get_con_id_and_polarity(struct int3472_discrete_device *int3472, u8 *type,
@@ -212,11 +229,11 @@ static void int3472_get_con_id_and_polarity(struct int3472_discrete_device *int3
 		*gpio_flags = GPIO_ACTIVE_HIGH;
 		break;
 	case INT3472_GPIO_TYPE_PRIVACY_LED:
-		*con_id = "privacy-led";
+		*con_id = "privacy";
 		*gpio_flags = GPIO_ACTIVE_HIGH;
 		break;
-	case 0x02: /* IR flood / strobe LED */
-		*con_id = "ir-led";
+	case INT3472_GPIO_TYPE_STROBE:
+		*con_id = "ir_flood";
 		*gpio_flags = GPIO_ACTIVE_HIGH;
 		break;
 	case INT3472_GPIO_TYPE_HOTPLUG_DETECT:
@@ -256,6 +273,7 @@ static void int3472_get_con_id_and_polarity(struct int3472_discrete_device *int3
  *
  * 0x00 Reset
  * 0x01 Power down
+ * 0x02 Strobe
  * 0x0b Power enable
  * 0x0c Clock enable
  * 0x0d Privacy LED
@@ -333,7 +351,6 @@ static int skl_int3472_handle_gpio_resources(struct acpi_resource *ares,
 	case INT3472_GPIO_TYPE_RESET:
 	case INT3472_GPIO_TYPE_POWERDOWN:
 	case INT3472_GPIO_TYPE_HOTPLUG_DETECT:
-	case 0x02: /* IR flood LED — map to sensor so driver can control it */
 		ret = skl_int3472_map_gpio_to_sensor(int3472, agpio, con_id, gpio_flags);
 		if (ret)
 			err_msg = "Failed to map GPIO pin to sensor\n";
@@ -341,6 +358,7 @@ static int skl_int3472_handle_gpio_resources(struct acpi_resource *ares,
 		break;
 	case INT3472_GPIO_TYPE_CLK_ENABLE:
 	case INT3472_GPIO_TYPE_PRIVACY_LED:
+	case INT3472_GPIO_TYPE_STROBE:
 	case INT3472_GPIO_TYPE_POWER_ENABLE:
 	case INT3472_GPIO_TYPE_DOVDD:
 	case INT3472_GPIO_TYPE_HANDSHAKE:
@@ -359,7 +377,8 @@ static int skl_int3472_handle_gpio_resources(struct acpi_resource *ares,
 
 			break;
 		case INT3472_GPIO_TYPE_PRIVACY_LED:
-			ret = skl_int3472_register_pled(int3472, gpio);
+		case INT3472_GPIO_TYPE_STROBE:
+			ret = skl_int3472_register_led(int3472, gpio, con_id);
 			if (ret)
 				err_msg = "Failed to register LED\n";
 
@@ -434,7 +453,7 @@ void int3472_discrete_cleanup(struct int3472_discrete_device *int3472)
 	gpiod_remove_lookup_table(&int3472->gpios);
 
 	skl_int3472_unregister_clock(int3472);
-	skl_int3472_unregister_pled(int3472);
+	skl_int3472_unregister_leds(int3472);
 	skl_int3472_unregister_regulator(int3472);
 }
 EXPORT_SYMBOL_NS_GPL(int3472_discrete_cleanup, "INTEL_INT3472_DISCRETE");
