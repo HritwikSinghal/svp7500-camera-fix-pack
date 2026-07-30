@@ -463,11 +463,44 @@ case "${_PH:-}" in
     sub "     Assertion '__n < this->size()' failed."
     sub "     SwStatsCpu::processBayerFrame2 <- Debayer{Cpu,EGL}::process"
     sub "   LIBCAMERA_SOFTISP_MODE=cpu does NOT help — it is the shared stats path."
-    sub "   Fix: build the IPU7 pipeline handler (hardware ISP via psys0):"
-    sub "     https://github.com/jibsta210/ipu7-camera-linux -> libcamera-pipeline/BUILD.md"
-    sub "   NOTE: its ISP parameters were captured for OV08X40. Another RGB"
-    sub "   sensor will need its own and may not work unmodified."
-    next "build the IPU7 libcamera pipeline handler — without it browsers cannot open this camera" ;;
+    # The hardware-ISP handler only works on Panther Lake. Its psys graph --
+    # node resource ids, terminal ids and buffer sizes -- was traced off the
+    # Intel Camera HAL on PTL silicon and is submitted verbatim, with no
+    # platform-conditional code anywhere in the pipeline handler. Lunar Lake
+    # runs different psys firmware with different program groups, so the
+    # firmware rejects it outright:
+    #
+    #   intel-ipu7-psys ipu7-psys0: group 3, code 38, detail: 3, 0
+    #   intel-ipu7-psys ipu7-psys0: ipu7_psys_handle_graph_open_ack, num_items is 0
+    #   intel-ipu7-psys ipu7-psys0: Failed to set graph
+    #   ERROR IPU7 psys.cpp:162 GRAPH_OPEN failed: Invalid argument
+    #
+    # The bridge HID tells you which you have without booting anything, so
+    # say so BEFORE someone spends an evening building libcamera. Reported by
+    # @jmrohwer (issue #5); the same split explains every machine in this repo.
+    # Glob, not equality: detect_hardware leaves a trailing space on HW_ACPI
+    # (it is built by appending "$hid " in a loop), so an exact compare never
+    # matches and this warning would silently never fire -- on precisely the
+    # machines that need it.
+    case "${HW_ACPI:-}" in *INTC10DE*)
+      sub "   NOTE: this board is INTC10DE (Lunar Lake). The IPU7 pipeline"
+      sub "   handler will NOT work here -- its psys graph was captured on"
+      sub "   Panther Lake and LNL firmware rejects it:"
+      sub "     ipu7_psys_handle_graph_open_ack, num_items is 0"
+      sub "     GRAPH_OPEN failed: Invalid argument"
+      sub "   Do not build it expecting a fix. Your camera still works from"
+      sub "   the CLI at native resolution; only scaled sizes abort."
+      next "no fix available on Lunar Lake yet — the hardware-ISP handler is Panther Lake only"
+      ;;
+    *)
+      sub "   Fix: build the IPU7 pipeline handler (hardware ISP via psys0):"
+      sub "     https://github.com/jibsta210/ipu7-camera-linux -> libcamera-pipeline/BUILD.md"
+      sub "   Verified on Panther Lake (bridge INTC10E1). Its psys graph is"
+      sub "   hardcoded from PTL silicon and is NOT portable to Lunar Lake"
+      sub "   (INTC10DE) -- the firmware there rejects it."
+      next "build the IPU7 libcamera pipeline handler — without it browsers cannot open this camera"
+      ;;
+    esac ;;
   "")
     p "libcamera pipeline" "not tested (no wireplumber journal for this boot)"
     untested "could not determine which libcamera pipeline handler PipeWire is using" ;;

@@ -465,6 +465,42 @@ laptop.
 
 ---
 
+## Panther Lake vs Lunar Lake
+
+Two IPU7 generations ship in these laptops and they behave differently. The
+bridge's ACPI HID tells you which you have, and `verify.sh` prints it:
+
+```
+bridge ACPI id      INTC10E1     Panther Lake
+bridge ACPI id      INTC10DE     Lunar Lake
+```
+
+Everything in this package works on both. The one thing that does not is the
+**IPU7 libcamera pipeline handler** in
+[ipu7-camera-linux](https://github.com/jibsta210/ipu7-camera-linux), which
+gives you the hardware ISP and is the only known fix for browsers crashing at
+scaled resolutions.
+
+Its psys graph -- node resource ids, terminal ids, terminal buffer sizes and
+links -- was traced off the Intel Camera HAL on Panther Lake and is submitted
+verbatim; there is no platform-conditional code in it at all. Lunar Lake runs
+different psys firmware with different program groups and rejects it:
+
+```
+intel-ipu7-psys ipu7-psys0: group 3, code 38, detail: 3, 0
+intel-ipu7-psys ipu7-psys0: ipu7_psys_handle_graph_open_ack, num_items is 0
+intel-ipu7-psys ipu7-psys0: Failed to set graph
+ERROR IPU7 psys.cpp:162 GRAPH_OPEN failed: Invalid argument
+```
+
+**On Lunar Lake, do not build it expecting a fix.** Making it work there needs
+a graph captured from LNL hardware, which nobody has done. Your camera still
+works from the CLI at native resolution; only the scaled sizes browsers ask
+for abort, and that abort is an upstream libcamera bug in the software ISP's
+statistics path, not something this package can patch.
+
+---
+
 ## Module load order
 
 The sensors on these boards are not on a native I2C controller. They sit behind
