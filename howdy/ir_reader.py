@@ -294,3 +294,70 @@ class ir_reader:
 		finally:
 			os.close(self.fd)
 			self.fd = None
+
+
+# --- IR illuminator failsafe teardown (omarchy howdy role) -------------------
+# The illuminator is pure USERSPACE state: record() writes 1 to the LED sysfs
+# node and only release() writes 0. Python's default SIGTERM disposition
+# terminates the process immediately -- no finally, no __del__, no atexit -- so
+# a SIGTERMed scan left the emitter latched ON.
+#
+# The failure is invisible without this: the kernel closes the V4L2 fd on
+# process death, so the SENSOR stops (hm1092 logs MODE_SELECT=0x00 standby) and
+# nothing further reaches the journal, while the emitter keeps burning. The
+# hm1092 driver cannot clean up either -- INT3472 claims this GPIO and exposes
+# it as a LED class device, which is why the driver reports ir_led=none.
+#
+# This is the ordinary walk-away path, not a corner case. howdy-face-unlock.sh
+# SIGTERMs a scan from its dpms watchdog the moment the display goes dark, and
+# again at its `timeout 10` cap; pam_howdy scans for sudo/polkit take a SIGINT
+# on Ctrl-C. One such kill (2026-08-13 20:24:20, dpms watchdog) left the
+# emitter on for 5h05m on battery with the screen off.
+#
+# SIGKILL stays unreachable by design -- howdy-face-unlock.sh asserts the LED
+# off after every scan and on every lit->dark edge to cover that.
+
+import atexit as _atexit
+import signal as _signal
+
+_ir_led_on = False
+_set_ir_led_unguarded = _set_ir_led
+
+
+def _set_ir_led(on):
+	"""Track the last state we successfully wrote, so teardown is a no-op."""
+	global _ir_led_on
+	ok = _set_ir_led_unguarded(on)
+	if ok:
+		_ir_led_on = bool(on)
+	return ok
+
+
+def _ir_led_failsafe_off():
+	if _ir_led_on:
+		_set_ir_led(False)
+
+
+_atexit.register(_ir_led_failsafe_off)
+
+
+def _ir_led_signal_teardown(signum, _frame):
+	"""Douse the illuminator, then die exactly as we would have.
+
+	Restoring SIG_DFL and re-raising preserves the WIFSIGNALED exit status that
+	howdy-face-unlock.sh and timeout(1) read to tell a kill from a no-match.
+	"""
+	_ir_led_failsafe_off()
+	_signal.signal(signum, _signal.SIG_DFL)
+	os.kill(os.getpid(), signum)
+
+
+# Claim only signals nobody else is handling, and only from the main thread
+# (signal.signal raises ValueError anywhere else). compare.py installs no
+# handlers and builds the recorder on the main thread, so these all take.
+for _sig in (_signal.SIGTERM, _signal.SIGHUP, _signal.SIGINT):
+	try:
+		if _signal.getsignal(_sig) in (_signal.SIG_DFL, _signal.default_int_handler):
+			_signal.signal(_sig, _ir_led_signal_teardown)
+	except (ValueError, OSError, AttributeError):
+		pass
