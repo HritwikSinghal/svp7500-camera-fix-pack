@@ -10,6 +10,7 @@
 extern struct intel_cvs *cvs;
 
 
+#ifdef DEBUG_CVS
 /*
  * IR 0x830 geometry overrides (2026-07-24). The Windows-verbatim IR payload
  * describes fps=30 lanes=2 3856x2176 -- the RGB sensor's geometry, NOT the
@@ -42,6 +43,7 @@ MODULE_PARM_DESC(ir_poke,
 static ushort ir_dt;
 module_param(ir_dt, ushort, 0644);
 MODULE_PARM_DESC(ir_dt, "Override MIPI data type in the IR 0x830 (0=verbatim, e.g. 0x2b)");
+#endif /* DEBUG_CVS */
 
 int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 {
@@ -220,6 +222,7 @@ int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 		if (data == NULL && len == 1) {
 			payload = windows_0x830_ir_body;
 			payload_label = "Windows verbatim IR (port 2)";
+#ifdef DEBUG_CVS
 			/*
 			 * Geometry override. The verbatim IR body encodes
 			 * fps=30 lanes=2 3856x2176 -- the RGB sensor's
@@ -285,6 +288,7 @@ int cvs_write_i2c(u16 cmd, u8 *data, u32 len)
 					 ir_patched[18] | (ir_patched[19] << 8),
 					 ir_patched[20]);
 			}
+#endif /* DEBUG_CVS */
 		} else if (data == NULL || len == 0) {
 			payload = windows_0x830_rgb_body;
 			payload_label = "Windows verbatim RGB (port 0)";

@@ -19,7 +19,9 @@
 
 #include "cvs_gpio.h"
 #include "intel_cvs_update.h"
+#ifdef DEBUG_CVS
 #include "rgb_hello_init.h"
+#endif
 
 struct intel_cvs *cvs;
 
@@ -54,6 +56,7 @@ MODULE_PARM_DESC(skip_probe_mipi,
 	"Skip the probe-time HOST_SET_MIPI_CONFIG so first 0x830 of session is "
 	"the IR variant from hm1092 stream-start (diagnostic for first-call-wins theory)");
 
+#ifdef DEBUG_CVS
 /*
  * cvs_replay_rgb_hello_init - replay the verbatim Windows-Hello RGB sensor
  * init stream via the kernel I2C path.
@@ -74,6 +77,7 @@ MODULE_PARM_DESC(skip_probe_mipi,
  * Returns 0 on full success, negative errno on any failure. Logs a count of
  * successful vs failed writes.
  */
+#endif /* DEBUG_CVS */
 /*
  * cvs_send_mipi_ir_config - send the verbatim Windows-trace IR HOST_SET_MIPI_CONFIG
  * (0x0830) payload to the SVP7500 bridge so port-2 forwarding gets configured.
@@ -86,6 +90,7 @@ MODULE_PARM_DESC(skip_probe_mipi,
  *
  * Returns 0 on success, negative errno on failure. Safe to call multiple times.
  */
+#ifdef DEBUG_CVS
 /*
  * cvs_send_2byte_cmd - send a raw 2-byte opcode to the bridge (big-endian).
  * Used for 0x820 / 0x822 — Vision.sys-known short commands we never see
@@ -108,6 +113,7 @@ static int cvs_send_2byte_cmd(u16 cmd)
 		 __func__, cmd, cnt);
 	return cnt == 2 ? 0 : -EIO;
 }
+#endif /* DEBUG_CVS */
 
 /*
  * NOTE 2026-05-13: I added a cvs_set_link_owner() here earlier today that
@@ -152,6 +158,7 @@ int cvs_send_mipi_ir_config(void)
 }
 EXPORT_SYMBOL_GPL(cvs_send_mipi_ir_config);
 
+#ifdef DEBUG_CVS
 static int cvs_replay_rgb_hello_init(void)
 {
 	struct i2c_client *i2c;
@@ -202,6 +209,7 @@ static int cvs_replay_rgb_hello_init(void)
 
 	return fail ? -EIO : 0;
 }
+#endif /* DEBUG_CVS */
 
 static irqreturn_t cvs_irq_handler(int irq, void *devid)
 {

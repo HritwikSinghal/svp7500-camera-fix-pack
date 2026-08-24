@@ -10,6 +10,13 @@ PWD := $(shell pwd)
 
 ccflags-y += -I$(src)/include/
 
+# Diagnostic sysfs surface (cmd/coredump attributes). Off by default; command
+# line variables propagate into the kbuild sub-make, so `make DEBUG_CVS=1`
+# enables it for bring-up builds.
+ifeq ($(DEBUG_CVS),1)
+ccflags-y += -DDEBUG_CVS
+endif
+
 all:
 	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) modules
 

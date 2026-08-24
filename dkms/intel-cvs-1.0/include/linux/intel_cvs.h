@@ -14,7 +14,12 @@
 #include <linux/i2c.h>
 #include <linux/workqueue.h>
 
-#define DEBUG_CVS
+/*
+ * DEBUG_CVS gates the diagnostic sysfs surface (the cmd attribute --
+ * factory-reset, arbitrary cmd-NNNN opcodes, coredump, mipi/mipi-ir -- and
+ * its helpers). Off by default so a deployed module does not ship it; build
+ * with `make DEBUG_CVS=1` to get it back for bring-up work.
+ */
 
 /* ICVS # of GPIOs */
 #define ICVS_FULL 4
