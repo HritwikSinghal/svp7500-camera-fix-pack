@@ -16,6 +16,7 @@
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
+#include <linux/leds.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
@@ -524,8 +525,17 @@ struct hm1092 {
 	bool extclk_enabled;
 	bool stream_clock_enabled;
 
-	/* IR flood LED — mapped by INT3472 type 0x02 as "ir-led" GPIO */
+	/*
+	 * IR flood illuminator. int3472 maps a type 0x02 (STROBE) pin with
+	 * con_id "ir_flood", and for that type it does NOT publish a GPIO --
+	 * skl_int3472_register_led() consumes the descriptor and exposes a LED
+	 * classdev plus a led_add_lookup() keyed on the sensor's device name.
+	 * So on this machine the gpiod path below never resolves ("ir_led=none")
+	 * and the LED one does. Keep both: some firmwares may still hand the pin
+	 * over as a plain GPIO.
+	 */
 	struct gpio_desc *ir_led;
+	struct led_classdev *ir_led_cdev;
 
 	bool streaming;
 
@@ -562,6 +572,18 @@ static int hm1092_read_reg(struct i2c_client *client, u16 reg, u8 *val)
 		return ret < 0 ? ret : -EIO;
 	}
 	return 0;
+}
+
+/*
+ * Drive the IR illuminator, whichever way the firmware exposed it. Called only
+ * around streaming, so the emitter is never left lit while idle.
+ */
+static void hm1092_ir_led_set(struct hm1092 *hm, bool on)
+{
+	if (hm->ir_led_cdev)
+		led_set_brightness(hm->ir_led_cdev, on ? 1 : 0);
+	if (hm->ir_led)
+		gpiod_set_value_cansleep(hm->ir_led, on ? 1 : 0);
 }
 
 static int hm1092_write_reg(struct i2c_client *client, u16 reg, u8 val)
@@ -1076,10 +1098,9 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 		}
 
 		/* Lazy-enable IR LED only while streaming */
-		if (hm->ir_led) {
-			gpiod_set_value_cansleep(hm->ir_led, 1);
-			dev_info(&client->dev, "  IR LED gpio set to 1\n");
-		}
+		hm1092_ir_led_set(hm, true);
+		dev_info(&client->dev, "  IR LED set to 1 (%s)\n",
+			 hm->ir_led_cdev ? "led" : hm->ir_led ? "gpio" : "absent");
 
 		hm->streaming = true;
 
@@ -1106,10 +1127,7 @@ static int hm1092_set_stream(struct v4l2_subdev *sd, int enable)
 		}
 
 		/* Turn off IR LED before sensor goes to standby */
-		if (hm->ir_led) {
-			gpiod_set_value_cansleep(hm->ir_led, 0);
-			dev_info(&client->dev, "  IR LED gpio set to 0\n");
-		}
+		hm1092_ir_led_set(hm, false);
 
 		ret = hm1092_write_reg(client, HM1092_REG_MODE_SELECT,
 				       HM1092_MODE_STANDBY);
@@ -1390,13 +1408,24 @@ static int hm1092_probe(struct i2c_client *client)
 		hm->ir_led = NULL;
 	}
 
+	/* The path that actually resolves on INT3472 STROBE machines. */
+	hm->ir_led_cdev = devm_led_get(dev, "ir_flood");
+	if (IS_ERR(hm->ir_led_cdev)) {
+		ret = PTR_ERR(hm->ir_led_cdev);
+		if (ret == -EPROBE_DEFER)
+			goto err_power;
+		hm->ir_led_cdev = NULL;
+	}
+	if (hm->ir_led_cdev)
+		led_set_brightness(hm->ir_led_cdev, 0);
+
 	dev_info(dev, "Power: dvdd=%s avdd=%s dovdd=%s clk=%s (%lu Hz) ir_led=%s\n",
 		 hm->dvdd ? "found" : "none",
 		 hm->avdd ? "found" : "none",
 		 hm->dovdd ? "found" : "none",
 		 hm->extclk ? "found" : "none",
 		 hm->extclk ? clk_get_rate(hm->extclk) : 0,
-		 hm->ir_led ? "found (off — lazy)" : "none");
+		 (hm->ir_led || hm->ir_led_cdev) ? "found (off — lazy)" : "none");
 
 	/* Give sensor time to boot after power-on */
 	usleep_range(20000, 25000);
@@ -1467,8 +1496,7 @@ static void hm1092_remove(struct i2c_client *client)
 	cancel_delayed_work_sync(&hm->ae_kick_work);
 
 	/* Safety: ensure IR LED is off on driver unload */
-	if (hm->ir_led)
-		gpiod_set_value_cansleep(hm->ir_led, 0);
+	hm1092_ir_led_set(hm, false);
 
 	v4l2_async_unregister_subdev(sd);
 	media_entity_cleanup(&sd->entity);
