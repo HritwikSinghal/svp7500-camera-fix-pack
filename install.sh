@@ -373,7 +373,7 @@ for f in "$HERE/udev/99-hm1092-ir-led.rules" "$HERE/udev/99-svp7500-no-autosuspe
 done
 # Howdy-side payload, checked only when the Howdy phase will run.
 if [[ $DO_HOWDY -eq 1 ]]; then
-  for f in "$HERE/howdy/ir_reader.py" "$HERE/howdy/video_capture.patch"; do
+  for f in "$HERE/howdy/ir_reader.py" "$HERE/howdy/ir-recorder-video_capture.patch"; do
     [[ -f $f ]] || pf_bad "package is missing ${f#"$HERE"/} — this clone/tarball is incomplete, re-download it"
   done
 fi
@@ -1607,7 +1607,7 @@ if [[ -z $HR ]] && command -v howdy >/dev/null 2>&1; then
   # skipping is not honest when the user asked for the Howdy phase.
   HOWDY_FAIL=$((HOWDY_FAIL+1))
   bad "howdy is installed at $(command -v howdy) but its recorders directory was not found (looked in: ${HR_TRIED[*]}) — the IR recorder cannot be installed"
-  action "find the directory containing Howdy's video_capture.py and copy howdy/ir_reader.py into it, then apply howdy/video_capture.patch by hand"
+  action "find the directory containing Howdy's video_capture.py and copy howdy/ir_reader.py into it, then apply howdy/ir-recorder-video_capture.patch by hand"
 elif [[ -z $HR ]]; then
   # Name the thing that is missing: Howdy. Not the camera, not DKMS.
   skip_step "Howdy is not installed (no recorders directory in: ${HR_TRIED[*]}, and no 'howdy' in PATH) — the whole Howdy phase was skipped"
@@ -1633,31 +1633,41 @@ else
     # Howdy ships video_capture.py mode 0444, so the backup and the chmod both
     # have to succeed before patching. Report, do not abort: an abort here
     # would skip the summary entirely.
+    #
+    # ir-recorder-video_capture.patch, NOT the older video_capture.patch. The
+    # latter cannot apply to stock Howdy at all -- alongside the ir branch it
+    # rewrites a `pipewire` recording plugin upstream Howdy has never had, so
+    # the context never matches and this phase always reported a failure with
+    # the IR plugin left unhooked. See howdy/README.md, "Which patch to use".
+    #
+    # The strip level is inert here because the target file is named on the
+    # command line; -p1 matches what howdy/README.md documents for applying
+    # these patches from the Howdy source root.
     run cp "$HR/video_capture.py" "$HR/video_capture.py.bak-$(date +%Y%m%d-%H%M%S)" \
       || warn "could not back up video_capture.py — continuing without a backup"
     run chmod 644 "$HR/video_capture.py" || warn "could not make video_capture.py writable — the patch below will probably fail"
     if [[ $DRY_RUN -eq 1 ]]; then
-      if patch -p0 --batch --forward --dry-run --silent "$HR/video_capture.py" < "$HERE/howdy/video_capture.patch" >/dev/null 2>&1; then
+      if patch -p1 --batch --forward --dry-run --silent "$HR/video_capture.py" < "$HERE/howdy/ir-recorder-video_capture.patch" >/dev/null 2>&1; then
         plan "would patch $HR/video_capture.py (patch --dry-run: applies cleanly)"
         HOWDY_OK=$((HOWDY_OK+1))
       else
-        bad "howdy/video_capture.patch does NOT apply to $HR/video_capture.py (dry run) — a real run would leave the IR plugin unhooked"
+        bad "howdy/ir-recorder-video_capture.patch does NOT apply to $HR/video_capture.py (dry run) — a real run would leave the IR plugin unhooked"
         HOWDY_FAIL=$((HOWDY_FAIL+1))
-        action "your Howdy version differs: apply $HERE/howdy/video_capture.patch to $HR/video_capture.py by hand"
+        action "your Howdy version differs: apply $HERE/howdy/ir-recorder-video_capture.patch to $HR/video_capture.py by hand"
       fi
-    elif PERR=$(patch -p0 --batch --forward --silent "$HR/video_capture.py" < "$HERE/howdy/video_capture.patch" 2>&1); then
+    elif PERR=$(patch -p1 --batch --forward --reject-file=- --no-backup-if-mismatch --silent "$HR/video_capture.py" < "$HERE/howdy/ir-recorder-video_capture.patch" 2>&1); then
       # Confirm from the file, not from patch's exit code.
       if grep -q 'ir_reader' "$HR/video_capture.py"; then
         HOWDY_OK=$((HOWDY_OK+1)); ok "patched video_capture.py"
       else
         HOWDY_FAIL=$((HOWDY_FAIL+1)); bad "patch succeeded but video_capture.py has no ir_reader hook"
-        action "apply $HERE/howdy/video_capture.patch to $HR/video_capture.py by hand"
+        action "apply $HERE/howdy/ir-recorder-video_capture.patch to $HR/video_capture.py by hand"
       fi
     else
       HOWDY_FAIL=$((HOWDY_FAIL+1))
-      bad "video_capture.py patch failed — your Howdy version differs; apply howdy/video_capture.patch by hand"
+      bad "video_capture.py patch failed — your Howdy version differs; apply howdy/ir-recorder-video_capture.patch by hand"
       printf '%s\n' "$PERR" | sed 's/^/          /'
-      action "apply $HERE/howdy/video_capture.patch to $HR/video_capture.py by hand"
+      action "apply $HERE/howdy/ir-recorder-video_capture.patch to $HR/video_capture.py by hand"
     fi
     run chmod 444 "$HR/video_capture.py" || warn "could not restore video_capture.py to mode 0444"
   else
