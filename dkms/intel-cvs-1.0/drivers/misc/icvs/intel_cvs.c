@@ -271,7 +271,6 @@ static int find_oem_prod_id(acpi_handle handle, const char *method_name,
 static int cvs_common_probe(struct device *dev, bool is_i2c)
 {
 	struct intel_cvs *icvs;
-	acpi_handle handle = NULL;
 	int ret = -ENODEV;
 
 	icvs = devm_kzalloc(dev, sizeof(struct intel_cvs), GFP_KERNEL);
@@ -356,10 +355,12 @@ static int cvs_common_probe(struct device *dev, bool is_i2c)
 
 		if (icvs->has_i2c) {
 			ret = cvs_init(icvs);
-			if (ret)
+			if (ret) {
 				dev_err(icvs->dev, "Failed to initialize\n");
+				goto exit;
+			}
 
-			find_oem_prod_id(handle, "OPID", &icvs->oem_prod_id);
+			find_oem_prod_id(ACPI_HANDLE(icvs->dev), "OPID", &icvs->oem_prod_id);
 
 			ret = cvs_find_magic_num_support(icvs);
 			if (ret)
@@ -369,21 +370,21 @@ static int cvs_common_probe(struct device *dev, bool is_i2c)
 				ret = cvs_get_device_cap(&icvs->cv_fw_capability);
 				if (ret)
 					goto exit;
-			}
 
-			/*
-			 * 2026-05-13: Wire-format of SET_HOST_IDENTIFIER is
-			 * hardcoded inside cvs_write_i2c() (intel_cvs_update.c)
-			 * — the data/len args are ignored for this opcode.
-			 * That hardcoded payload was missing privacy_led_host=1
-			 * which Miguel Vadillo's upstream driver sends for
-			 * Synaptics SVP7xxx per the quirks table.  Fix is in
-			 * cvs_write_i2c case SET_HOST_IDENTIFIER (flip one bit).
-			 */
-			ret = cvs_write_i2c(SET_HOST_IDENTIFIER, NULL, 0);
-			if (ret) {
-				dev_err(cvs->dev, "%s:set_host_identifier cmd failed", __func__);
-				goto exit;
+				/*
+				 * 2026-05-13: Wire-format of SET_HOST_IDENTIFIER is
+				 * hardcoded inside cvs_write_i2c() (intel_cvs_update.c)
+				 * — the data/len args are ignored for this opcode.
+				 * That hardcoded payload was missing privacy_led_host=1
+				 * which Miguel Vadillo's upstream driver sends for
+				 * Synaptics SVP7xxx per the quirks table.  Fix is in
+				 * cvs_write_i2c case SET_HOST_IDENTIFIER (flip one bit).
+				 */
+				ret = cvs_write_i2c(SET_HOST_IDENTIFIER, NULL, 0);
+				if (ret) {
+					dev_err(cvs->dev, "%s:set_host_identifier cmd failed", __func__);
+					goto exit;
+				}
 			}
 
 			/*
@@ -1323,6 +1324,7 @@ static struct acpi_device_id acpi_cvs_ids[] = { { "INTC10CF" }, /* MTL */
 						{ "INTC10DE" }, /* LNL */
 						{ "INTC10E0" }, /* ARL */
 						{ "INTC10E1" }, /* PTL */
+						{ "INTC10FA" }, /*NVL */
 						{ /* END OF LIST */ } };
 MODULE_DEVICE_TABLE(acpi, acpi_cvs_ids);
 
