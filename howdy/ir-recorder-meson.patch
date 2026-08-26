@@ -1,0 +1,10 @@
+--- a/howdy/src/meson.build
++++ b/howdy/src/meson.build
+@@ -33,6 +33,7 @@
+     'paths_factory.py',
+     'recorders/__init__.py',
+     'recorders/ffmpeg_reader.py',
++    'recorders/ir_reader.py',
+     'recorders/pyv4l2_reader.py',
+     'recorders/v4l2.py',
+     'recorders/video_capture.py',
